@@ -1,0 +1,31 @@
+[tool.ruff]
+# Set the maximum line length
+line-length = 120
+
+# Target Python version (adjust if you are using something else)
+target-version = "py310"
+
+[tool.ruff.lint]
+# Enable specific linting rules
+# E: pycodestyle (standard python styling)
+# F: Pyflakes (unused imports, undefined variables)
+# I: isort (automatically sorts and groups your imports)
+# W: Warnings (e.g., trailing whitespace)
+select = ["E", "F", "I", "W"]
+
+# Ignore specific rules if they get too annoying
+ignore = []
+
+[tool.ruff.format]
+# Use double quotes for strings.
+quote-style = "double"
+# Indent with spaces, not tabs.
+indent-style = "space"
+
+[tool.ruff.lint.isort]
+# Prevent grouping
+no-sections = true
+# Sort everything alphabetically regardless of type
+force-sort-within-sections = true
+# (Optional) Order by name rather than type (e.g., consts before classes)
+order-by-type = false
