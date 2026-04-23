@@ -1,6 +1,6 @@
 [tool.ruff]
 # Set the maximum line length
-line-length = 120
+line-length = 100
 
 # Target Python version (adjust if you are using something else)
 target-version = "py310"
