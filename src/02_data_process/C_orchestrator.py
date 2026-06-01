@@ -7,9 +7,18 @@ import logging
 import os
 import pandas as pd
 from pyannote.audio import Pipeline
-from pyannote.audio.telemetry import set_telemetry_metrics
+from pyannote.audio.core.task import Problem, Resolution, Specifications
 import shlex
 import torch
+from torch.torch_version import TorchVersion
+import warnings
+
+# Ignores some warnings from pyannote
+warnings.filterwarnings("ignore", message=".*TensorFloat-32.*")
+warnings.filterwarnings("ignore", message=".*degrees of freedom is <= 0.*")
+
+# Tell PyTorch 2.6's security system to trust Pyannote's metadata
+torch.serialization.add_safe_globals([TorchVersion, Specifications, Problem, Resolution])
 
 logging.basicConfig(
     level=logging.INFO,
@@ -43,7 +52,6 @@ class LusoLaughDatasetGenerator:
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         self.compute_type = "float16" if self.device == "cuda" else "int8"
 
-        set_telemetry_metrics(False, save_choice_as_default=True)
         self._init_models()
 
     def _init_models(self):
@@ -68,9 +76,7 @@ class LusoLaughDatasetGenerator:
 
         logger.info("Loading Pyannote directly from Hugging Face Hub...")
         try:
-            self.diarization_pipeline = Pipeline.from_pretrained(
-                "pyannote/speaker-diarization-3.1", token=hf_token
-            )
+            self.diarization_pipeline = Pipeline.from_pretrained("pyannote/speaker-diarization-3.1")
 
             if self.device == "cuda":
                 self.diarization_pipeline.to(torch.device("cuda"))
