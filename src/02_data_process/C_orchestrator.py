@@ -1,3 +1,17 @@
+import logging
+import warnings
+
+warnings.filterwarnings("ignore", category=UserWarning, module="torchaudio.*")
+warnings.filterwarnings("ignore", message=".*TorchCodec.*")
+warnings.filterwarnings("ignore", message=".*list_audio_backends.*")
+warnings.filterwarnings("ignore", message=".*degrees of freedom is <= 0.*")
+warnings.filterwarnings("ignore", message=".*TensorFloat-32.*")
+
+# Force Lightning to only show critical errors, hiding the "upgraded checkpoint" INFO logs
+logging.getLogger("pytorch_lightning").setLevel(logging.ERROR)
+logging.getLogger("lightning.pytorch.utilities.migration.utils").setLevel(logging.ERROR)
+logging.getLogger("lightning").setLevel(logging.ERROR)
+
 import argparse
 from dotenv import load_dotenv
 import gc
@@ -9,6 +23,7 @@ from omegaconf.listconfig import ListConfig
 import os
 import pandas as pd
 import shlex
+import shutil
 import torch
 from typing import Any
 import warnings
@@ -26,22 +41,6 @@ torch.load = patched_load
 
 import demucs.separate
 import whisperx
-
-# Silence TorchAudio/Demucs deprecation warnings
-warnings.filterwarnings("ignore", category=UserWarning, module="torchaudio.*")
-warnings.filterwarnings("ignore", message=".*TorchCodec.*")
-warnings.filterwarnings("ignore", message=".*list_audio_backends.*")
-
-# Silence Pyannote math and GPU architecture warnings
-warnings.filterwarnings("ignore", message=".*degrees of freedom is <= 0.*")
-warnings.filterwarnings("ignore", message=".*TensorFloat-32.*")
-
-# Silence PyTorch Lightning's dramatic checkpoint warnings
-warnings.filterwarnings("ignore", message=".*Lightning automatically upgraded.*")
-warnings.filterwarnings("ignore", message=".*Bad things might happen.*")
-
-# Force PyTorch Lightning's logger to only show critical errors
-logging.getLogger("pytorch_lightning").setLevel(logging.ERROR)
 
 # Tell PyTorch 2.6 to trust the VAD metadata used by WhisperX
 torch.serialization.add_safe_globals([ListConfig, DictConfig, ContainerMetadata, Any])
@@ -237,6 +236,11 @@ class LusoLaughDatasetGenerator:
                 json.dump(final_corpus_entry, f, ensure_ascii=False, indent=4)
 
             logger.info(f"Luso-Laugh corpus entry serialized to {out_file}")
+
+            if not self.dry_run:
+                sketch_demucs_folder = os.path.join(self.output_dir, sketch_id)
+                if os.path.isdir(sketch_demucs_folder):
+                    shutil.rmtree(sketch_demucs_folder)
             return True
 
         except Exception as e:
