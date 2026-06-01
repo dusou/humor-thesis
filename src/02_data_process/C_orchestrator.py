@@ -1,24 +1,50 @@
 import argparse
-import demucs.separate
 from dotenv import load_dotenv
-from faster_whisper import WhisperModel
+import gc
 import json
 import logging
+from omegaconf.base import ContainerMetadata
+from omegaconf.dictconfig import DictConfig
+from omegaconf.listconfig import ListConfig
 import os
 import pandas as pd
-from pyannote.audio import Pipeline
-from pyannote.audio.core.task import Problem, Resolution, Specifications
 import shlex
 import torch
-from torch.torch_version import TorchVersion
+from typing import Any
 import warnings
 
-# Ignores some warnings from pyannote
-warnings.filterwarnings("ignore", message=".*TensorFloat-32.*")
-warnings.filterwarnings("ignore", message=".*degrees of freedom is <= 0.*")
+# This intercepts every single model load in your entire project
+original_load = torch.load
 
-# Tell PyTorch 2.6's security system to trust Pyannote's metadata
-torch.serialization.add_safe_globals([TorchVersion, Specifications, Problem, Resolution])
+
+def patched_load(*args, **kwargs):
+    kwargs["weights_only"] = False
+    return original_load(*args, **kwargs)
+
+
+torch.load = patched_load
+
+import demucs.separate
+import whisperx
+
+# Silence TorchAudio/Demucs deprecation warnings
+warnings.filterwarnings("ignore", category=UserWarning, module="torchaudio.*")
+warnings.filterwarnings("ignore", message=".*TorchCodec.*")
+warnings.filterwarnings("ignore", message=".*list_audio_backends.*")
+
+# Silence Pyannote math and GPU architecture warnings
+warnings.filterwarnings("ignore", message=".*degrees of freedom is <= 0.*")
+warnings.filterwarnings("ignore", message=".*TensorFloat-32.*")
+
+# Silence PyTorch Lightning's dramatic checkpoint warnings
+warnings.filterwarnings("ignore", message=".*Lightning automatically upgraded.*")
+warnings.filterwarnings("ignore", message=".*Bad things might happen.*")
+
+# Force PyTorch Lightning's logger to only show critical errors
+logging.getLogger("pytorch_lightning").setLevel(logging.ERROR)
+
+# Tell PyTorch 2.6 to trust the VAD metadata used by WhisperX
+torch.serialization.add_safe_globals([ListConfig, DictConfig, ContainerMetadata, Any])
 
 logging.basicConfig(
     level=logging.INFO,
@@ -52,42 +78,21 @@ class LusoLaughDatasetGenerator:
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         self.compute_type = "float16" if self.device == "cuda" else "int8"
 
+        self.hf_token = os.getenv("HF_TOKEN")
+        if not self.hf_token and not self.dry_run:
+            raise ValueError("HF_TOKEN environment variable is missing. Check your .env file.")
+
         self._init_models()
 
     def _init_models(self):
         # IF DRY RUN: Skip all heavy model initializations
         if self.dry_run:
             logger.info("DRY RUN MODE ACTIVE: Skipping neural pipeline initialization.")
-            self.asr_model = None
-            self.diarization_pipeline = None
             return
 
-        logger.info(f"Initializing neural pipelines on {self.device.upper()}...")
-
-        logger.info("Loading Faster-Whisper...")
-        self.asr_model = WhisperModel(
-            "large-v3", device=self.device, compute_type=self.compute_type
+        logger.info(
+            f"Verified environment. Neural models will be loaded dynamically on {self.device.upper()}."
         )
-
-        # Fetch the token securely from the .env file
-        hf_token = os.getenv("HF_TOKEN")
-        if not hf_token:
-            raise ValueError("HF_TOKEN environment variable is missing. Check your .env file.")
-
-        logger.info("Loading Pyannote directly from Hugging Face Hub...")
-        try:
-            self.diarization_pipeline = Pipeline.from_pretrained("pyannote/speaker-diarization-3.1")
-
-            if self.device == "cuda":
-                self.diarization_pipeline.to(torch.device("cuda"))
-
-        except Exception as e:
-            logger.error(f"Failed to load Pyannote from Hugging Face API: {e}")
-            logger.warning(
-                "Check your internet connection, HF token, and ensure you accepted the terms."
-            )
-            self.diarization_pipeline = None
-
         logger.info("STUB: Laughter Detector initialization skipped.")
         logger.info("STUB: Ollama connection skipped.")
 
@@ -134,63 +139,61 @@ class LusoLaughDatasetGenerator:
                 }
             ]
 
-        logger.info("Executing VAD-filtered transcription and speaker clustering...")
+        logger.info("Executing WhisperX Transcription...")
 
-        segments, info = self.asr_model.transcribe(
-            vocals_path, word_timestamps=True, vad_filter=True, language="pt"
+        # 1. Load Audio
+        audio = whisperx.load_audio(vocals_path)
+
+        # 2. Transcribe
+        model = whisperx.load_model(
+            "large-v3", self.device, compute_type=self.compute_type, language="pt"
+        )
+        result = model.transcribe(audio, batch_size=16, language="pt")
+
+        # Free memory
+        del model
+        gc.collect()
+        torch.cuda.empty_cache()
+
+        # 3. Align
+        logger.info(f"Aligning word-level timestamps for language: {result['language']}...")
+        model_a, metadata = whisperx.load_align_model(
+            language_code=result["language"], device=self.device
+        )
+        result = whisperx.align(
+            result["segments"], model_a, metadata, audio, self.device, return_char_alignments=False
         )
 
-        words = []
-        for segment in segments:
-            for word in segment.words:
-                words.append({"word": word.word, "start": word.start, "end": word.end})
+        # Free memory
+        del model_a
+        gc.collect()
+        torch.cuda.empty_cache()
 
-        speaker_segments = []
-        if self.diarization_pipeline:
-            diarization = self.diarization_pipeline(vocals_path)
-            for turn, _, speaker in diarization.itertracks(yield_label=True):
-                speaker_segments.append({"speaker": speaker, "start": turn.start, "end": turn.end})
-        else:
-            speaker_segments = [{"speaker": "SPEAKER_00", "start": 0.0, "end": 9999.0}]
+        # 4. Diarize
+        logger.info("Executing Speaker Diarization...")
+        diarize_model = whisperx.diarize.DiarizationPipeline(
+            use_auth_token=self.hf_token, device=self.device
+        )
+        diarize_segments = diarize_model(audio)
 
+        # Free memory
+        del diarize_model
+        gc.collect()
+        torch.cuda.empty_cache()
+
+        # 5. Merge
+        logger.info("Assigning precise timestamps to speakers...")
+        final_result = whisperx.assign_word_speakers(diarize_segments, result)
+
+        # 6. Format to match corpus schema
         aligned_script = []
-        current_sentence = ""
-        current_speaker = None
-        sentence_start = 0.0
-
-        for w in words:
-            best_speaker = "UNKNOWN"
-            max_overlap = 0
-
-            for spk in speaker_segments:
-                overlap = max(0, min(w["end"], spk["end"]) - max(w["start"], spk["start"]))
-                if overlap > max_overlap:
-                    max_overlap = overlap
-                    best_speaker = spk["speaker"]
-
-            if best_speaker != current_speaker:
-                if current_sentence:
-                    aligned_script.append(
-                        {
-                            "speaker": current_speaker,
-                            "text": current_sentence.strip(),
-                            "start": sentence_start,
-                            "end": w["start"],
-                        }
-                    )
-                current_speaker = best_speaker
-                current_sentence = w["word"]
-                sentence_start = w["start"]
-            else:
-                current_sentence += " " + w["word"]
-
-        if current_sentence:
+        for segment in final_result["segments"]:
             aligned_script.append(
                 {
-                    "speaker": current_speaker,
-                    "text": current_sentence.strip(),
-                    "start": sentence_start,
-                    "end": words[-1]["end"],
+                    "speaker": segment.get("speaker", "UNKNOWN"),
+                    "text": segment["text"].strip(),
+                    "start": segment["start"],
+                    "end": segment["end"],
                 }
             )
 
@@ -226,7 +229,7 @@ class LusoLaughDatasetGenerator:
         try:
             stems = self.separate_sources(audio_path, sketch_id)
             laughs = self.detect_laughter(stems["accompaniment"])
-            script = self.transcribe_and_diarize(stems["vocals"])
+            script = self.transcribe_and_diarize(audio_path)
             final_corpus_entry = self.annotate_irony(script, laughs)
 
             out_file = os.path.join(self.output_json_dir, f"{sketch_id}_annotated.json")
@@ -272,7 +275,7 @@ if __name__ == "__main__":
 
     for index, row in ready_sketches.iterrows():
         sketch_id = str(row["sketch_id"])
-        logger.info(f"--- Processing Sketch ID: {sketch_id} ---")
+        logger.info(f"\033[96m--- Processing Sketch ID: {sketch_id} ---\033[0m")
 
         success = generator.process_sketch_remote(sketch_id)
 
