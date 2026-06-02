@@ -1,17 +1,3 @@
-import logging
-import warnings
-
-warnings.filterwarnings("ignore", category=UserWarning, module="torchaudio.*")
-warnings.filterwarnings("ignore", message=".*TorchCodec.*")
-warnings.filterwarnings("ignore", message=".*list_audio_backends.*")
-warnings.filterwarnings("ignore", message=".*degrees of freedom is <= 0.*")
-warnings.filterwarnings("ignore", message=".*TensorFloat-32.*")
-
-# Force Lightning to only show critical errors, hiding the "upgraded checkpoint" INFO logs
-logging.getLogger("pytorch_lightning").setLevel(logging.ERROR)
-logging.getLogger("lightning.pytorch.utilities.migration.utils").setLevel(logging.ERROR)
-logging.getLogger("lightning").setLevel(logging.ERROR)
-
 import argparse
 from dotenv import load_dotenv
 import gc
@@ -25,8 +11,20 @@ import pandas as pd
 import shlex
 import shutil
 import torch
+from transformers import pipeline
 from typing import Any
 import warnings
+
+warnings.filterwarnings("ignore", category=UserWarning, module="torchaudio.*")
+warnings.filterwarnings("ignore", message=".*TorchCodec.*")
+warnings.filterwarnings("ignore", message=".*list_audio_backends.*")
+warnings.filterwarnings("ignore", message=".*degrees of freedom is <= 0.*")
+warnings.filterwarnings("ignore", message=".*TensorFloat-32.*")
+
+# Force Lightning to only show critical errors, hiding the "upgraded checkpoint" INFO logs
+logging.getLogger("pytorch_lightning").setLevel(logging.ERROR)
+logging.getLogger("lightning.pytorch.utilities.migration.utils").setLevel(logging.ERROR)
+logging.getLogger("lightning").setLevel(logging.ERROR)
 
 # This intercepts every single model load in your entire project
 original_load = torch.load
@@ -92,8 +90,29 @@ class LusoLaughDatasetGenerator:
         logger.info(
             f"Verified environment. Neural models will be loaded dynamically on {self.device.upper()}."
         )
-        logger.info("STUB: Laughter Detector initialization skipped.")
-        logger.info("STUB: Ollama connection skipped.")
+
+        logger.info("Loading MIT AudioSet Transformer for laughter detection...")
+        try:
+            self.laughter_pipeline = pipeline(
+                "audio-classification",
+                model="MIT/ast-finetuned-audioset-10-10-0.4593",
+                device=0 if self.device == "cuda" else -1,
+            )
+        except Exception as e:
+            logger.error(f"Failed to load laughter model: {e}")
+            self.laughter_pipeline = None
+
+        logger.info("Loading Qwen2.5-1.5B...")
+        try:
+            self.llm_pipeline = pipeline(
+                "text-generation",
+                model="Qwen/Qwen2.5-1.5B-Instruct",
+                model_kwargs={"torch_dtype": torch.bfloat16},
+                device_map="auto",
+            )
+        except Exception as e:
+            logger.error(f"Failed to load local LLM: {e}")
+            self.llm_pipeline = None
 
     def separate_sources(self, audio_path: str, sketch_id: str) -> dict:
         out_dir = os.path.join(self.output_dir, sketch_id, "demucs_output")
@@ -117,13 +136,64 @@ class LusoLaughDatasetGenerator:
             "accompaniment": os.path.join(stem_dir, "no_vocals.wav"),
         }
 
-    def detect_laughter(self, accompaniment_path: str, threshold=0.5, min_length=0.2) -> list:
-        if self.dry_run:
-            logger.info("[DRY RUN] Skipping biological punchline mapping.")
-            return []
+    def detect_laughter(self, audio_path: str, chunk_duration=3.0, step_duration=2.0) -> list:
+        if self.dry_run or not self.laughter_pipeline:
+            logger.info("[DRY RUN] Skipping neural punchline mapping.")
+            return [{"start": 10.0, "end": 12.0}]
 
-        logger.info("STUB: Skipping biological punchline mapping.")
-        return []
+        logger.info("Running AI Audio Classification for laughter detection...")
+        try:
+            # 1. Load the RAW audio (bypass Demucs vocal stripping)
+            y = whisperx.load_audio(audio_path)
+            sr = 16000
+
+            chunk_samples = int(chunk_duration * sr)
+            step_samples = int(step_duration * sr)
+            raw_laughs = []
+
+            # AudioSet actually has multiple classes for laughter!
+            laugh_labels = ["Laughter", "Giggle", "Snicker", "Belly laugh", "Chuckle, chortle"]
+
+            # 2. Overlapping sliding window
+            # It grabs 3 seconds of audio, but only moves forward 2 seconds each time
+            for i in range(0, len(y), step_samples):
+                chunk = y[i : i + chunk_samples]
+
+                if len(chunk) < sr:
+                    continue
+
+                # 3. THE MAGIC FIX: top_k=20
+                # Forces the AI to give us its top 20 guesses, not just the top 5!
+                result = self.laughter_pipeline(chunk, top_k=20)
+
+                # Check if ANY of the laughter categories are in the top 20 with at least 5% confidence
+                is_laugh = any(
+                    pred["label"] in laugh_labels and pred["score"] > 0.05 for pred in result
+                )
+
+                if is_laugh:
+                    start_time = i / sr
+                    end_time = (i + len(chunk)) / sr
+                    raw_laughs.append({"start": float(start_time), "end": float(end_time)})
+
+            # Merge overlapping 3-second chunks into continuous events
+            merged_laughs = []
+            for laugh in raw_laughs:
+                if not merged_laughs:
+                    merged_laughs.append(laugh)
+                else:
+                    last = merged_laughs[-1]
+                    if laugh["start"] - last["end"] <= 1.5:
+                        last["end"] = max(last["end"], laugh["end"])
+                    else:
+                        merged_laughs.append(laugh)
+
+            logger.info(f"Detected {len(merged_laughs)} discrete laughter events.")
+            return merged_laughs
+
+        except Exception as e:
+            logger.error(f"Laughter detection failed: {e}")
+            return []
 
     def transcribe_and_diarize(self, vocals_path: str) -> list:
         # IF DRY RUN: Return dummy script data
@@ -199,16 +269,81 @@ class LusoLaughDatasetGenerator:
         return aligned_script
 
     def annotate_irony(self, aligned_script: list, laughs: list) -> list:
-        if self.dry_run:
+        if self.dry_run or not self.llm_pipeline:
             logger.info("[DRY RUN] Skipping semantic LLM annotation.")
-            status_message = "Dry Run Complete."
-        else:
-            logger.info("STUB: Skipping semantic LLM annotation.")
-            status_message = "Stubbed. Awaiting LLM integration."
+            return aligned_script
 
-        for line in aligned_script:
+        logger.info("Mapping laughs to punchlines and running Local LLM inference...")
+
+        for i, line in enumerate(aligned_script):
             line["is_punchline"] = False
-            line["semantic_metadata"] = {"status": status_message}
+            line["semantic_metadata"] = {}
+
+            # Map laughs: If a laugh happens within 2.5 seconds of this line ending
+            for laugh in laughs:
+                if line["start"] <= laugh["start"] <= (line["end"] + 2.5):
+                    line["is_punchline"] = True
+                    break
+
+            # If it is a punchline, ask the local LLM
+            if line["is_punchline"]:
+                start_idx = max(0, i - 10)
+                context_lines = aligned_script[start_idx:i]
+
+                context_list = []
+                for ctx_line in context_lines:
+                    speaker = ctx_line.get("speaker", "UNKNOWN")
+                    text = ctx_line.get("text", "")
+                    context_list.append(f"[{speaker}]: {text}")
+
+                # Join them together with newlines
+                context = "\n".join(context_list)
+
+                # Identify the current punchline's speaker
+                current_speaker = line.get("speaker", "UNKNOWN")
+
+                prompt = f"""
+                És um analista linguístico profissional a estudar comédia em português.
+                Abaixo está o contexto do diálogo, seguido pela piada final (punchline).
+                --- DIALOGUE CONTEXT ---
+                {context}
+                --- TARGET PUNCHLINE ---
+                [{current_speaker}]: "{line["text"]}"
+                ------------------------
+                Explica brevemente a ironia, o sarcasmo ou o humor da piada final com base no contexto. 
+                Responde em Português de Portugal. Máximo de 2 frases.
+                REGRA CRÍTICA: Mantém um tom estritamente académico, educado e descritivo. É expressamente proibido o uso de palavrões, calão, vulgaridades ou linguagem ofensiva na tua explicação, mesmo que o diálogo original contenha essas palavras. Usa eufemismos educados se necessário.
+                """
+
+                # 1. Give the System a strict, professional persona
+                messages = [
+                    {
+                        "role": "system",
+                        "content": "You are a highly professional, polite, and academic AI analyzing Portuguese comedy. You strictly avoid profanity, slang, and vulgarity.",
+                    },
+                    {"role": "user", "content": prompt},
+                ]
+
+                try:
+                    outputs = self.llm_pipeline(
+                        messages,
+                        max_new_tokens=150,
+                        temperature=0.5,
+                        do_sample=True,
+                    )
+
+                    llm_explanation = outputs[0]["generated_text"][-1]["content"].strip()
+
+                    line["semantic_metadata"]["humor_analysis"] = llm_explanation
+                    logger.info(
+                        f"\033[95mAnnotated punchline at {line['start']:.2f}s: {llm_explanation[:50]}...\033[0m"
+                    )
+
+                except Exception as e:
+                    line["semantic_metadata"]["humor_analysis"] = f"Local LLM Error: {str(e)}"
+                    logger.warning(
+                        f"Failed to generate annotation for line at {line['start']:.2f}s."
+                    )
 
         return aligned_script
 
@@ -226,8 +361,8 @@ class LusoLaughDatasetGenerator:
         logger.info(f"Commencing {mode_text} for {sketch_id}...")
 
         try:
-            stems = self.separate_sources(audio_path, sketch_id)
-            laughs = self.detect_laughter(stems["accompaniment"])
+            # stems = self.separate_sources(audio_path, sketch_id)
+            laughs = self.detect_laughter(audio_path)
             script = self.transcribe_and_diarize(audio_path)
             final_corpus_entry = self.annotate_irony(script, laughs)
 
