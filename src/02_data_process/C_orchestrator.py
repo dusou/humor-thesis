@@ -102,11 +102,11 @@ class LusoLaughDatasetGenerator:
             logger.error(f"Failed to load laughter model: {e}")
             self.laughter_pipeline = None
 
-        logger.info("Loading Qwen2.5-1.5B...")
+        logger.info("Loading Qwen2.5-7B-Instruct...")
         try:
             self.llm_pipeline = pipeline(
                 "text-generation",
-                model="Qwen/Qwen2.5-1.5B-Instruct",
+                model="Qwen/Qwen2.5-7B-Instruct",
                 model_kwargs={"torch_dtype": torch.bfloat16},
                 device_map="auto",
             )
