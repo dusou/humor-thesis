@@ -8,10 +8,10 @@ from omegaconf.dictconfig import DictConfig
 from omegaconf.listconfig import ListConfig
 import os
 import pandas as pd
+from pathlib import Path
 import shlex
 import shutil
 import torch
-from transformers import pipeline
 from typing import Any
 import warnings
 
@@ -26,20 +26,6 @@ logging.getLogger("pytorch_lightning").setLevel(logging.ERROR)
 logging.getLogger("lightning.pytorch.utilities.migration.utils").setLevel(logging.ERROR)
 logging.getLogger("lightning").setLevel(logging.ERROR)
 
-# This intercepts every single model load in your entire project
-original_load = torch.load
-
-
-def patched_load(*args, **kwargs):
-    kwargs["weights_only"] = False
-    return original_load(*args, **kwargs)
-
-
-torch.load = patched_load
-
-import demucs.separate
-import whisperx
-
 # Tell PyTorch 2.6 to trust the VAD metadata used by WhisperX
 torch.serialization.add_safe_globals([ListConfig, DictConfig, ContainerMetadata, Any])
 
@@ -51,6 +37,49 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 load_dotenv()
+
+# Connection to internet logic
+os.environ["HF_HUB_DISABLE_TELEMETRY"] = "1"
+hf_cache = Path(os.path.expanduser("~/.cache/huggingface/hub"))
+qwen_folder = hf_cache / "models--Qwen--Qwen3.5-9B"
+
+if qwen_folder.exists():
+    os.environ["HF_HUB_OFFLINE"] = "1"
+    os.environ["TRANSFORMERS_OFFLINE"] = "1"
+    logger.info("Local models found. Engaging offline mode.")
+else:
+    logger.info("Models missing. Allowing internet access for initial download...")
+
+import demucs.separate
+import transformers
+import whisperx
+
+transformers.logging.set_verbosity_error()
+
+# Patch loads
+original_load = torch.load
+
+
+def patched_load(*args, **kwargs):
+    kwargs["weights_only"] = False
+    return original_load(*args, **kwargs)
+
+
+import huggingface_hub
+
+torch.load = patched_load
+
+# Patch downloads
+_original_download = huggingface_hub.hf_hub_download
+
+
+def _patched_download(*args, **kwargs):
+    if "use_auth_token" in kwargs:
+        kwargs["token"] = kwargs.pop("use_auth_token")
+    return _original_download(*args, **kwargs)
+
+
+huggingface_hub.hf_hub_download = _patched_download
 
 
 class LusoLaughDatasetGenerator:
@@ -93,7 +122,7 @@ class LusoLaughDatasetGenerator:
 
         logger.info("Loading MIT AudioSet Transformer for laughter detection...")
         try:
-            self.laughter_pipeline = pipeline(
+            self.laughter_pipeline = transformers.pipeline(
                 "audio-classification",
                 model="MIT/ast-finetuned-audioset-10-10-0.4593",
                 device=0 if self.device == "cuda" else -1,
@@ -102,12 +131,12 @@ class LusoLaughDatasetGenerator:
             logger.error(f"Failed to load laughter model: {e}")
             self.laughter_pipeline = None
 
-        logger.info("Loading Qwen2.5-7B-Instruct...")
+        logger.info("Loading Qwen3.5-9B...")
         try:
-            self.llm_pipeline = pipeline(
+            self.llm_pipeline = transformers.pipeline(
                 "text-generation",
-                model="Qwen/Qwen2.5-7B-Instruct",
-                model_kwargs={"torch_dtype": torch.bfloat16},
+                model="Qwen/Qwen3.5-9B",
+                dtype=torch.bfloat16,
                 device_map="auto",
             )
         except Exception as e:
@@ -310,9 +339,12 @@ class LusoLaughDatasetGenerator:
                 --- TARGET PUNCHLINE ---
                 [{current_speaker}]: "{line["text"]}"
                 ------------------------
-                Explica brevemente a ironia, o sarcasmo ou o humor da piada final com base no contexto. 
-                Responde em Português de Portugal. Máximo de 2 frases.
-                REGRA CRÍTICA: Mantém um tom estritamente académico, educado e descritivo. É expressamente proibido o uso de palavrões, calão, vulgaridades ou linguagem ofensiva na tua explicação, mesmo que o diálogo original contenha essas palavras. Usa eufemismos educados se necessário.
+                Explica brevemente a ironia, o sarcasmo ou o humor da piada final com base no contexto.
+                Responde em Português de Portugal. Máximo de 4 frases.
+                REGRA CRÍTICA: Usa apenas vocabulário académico, formal e eufemismos educados na tua análise.
+
+                FORMATO OBRIGATÓRIO:
+                EXPLICAÇÃO: [Escreve a tua análise aqui]
                 """
 
                 # 1. Give the System a strict, professional persona
@@ -322,22 +354,30 @@ class LusoLaughDatasetGenerator:
                         "content": "You are a highly professional, polite, and academic AI analyzing Portuguese comedy. You strictly avoid profanity, slang, and vulgarity.",
                     },
                     {"role": "user", "content": prompt},
+                    {"role": "assistant", "content": "EXPLICAÇÃO:"},
                 ]
 
                 try:
                     outputs = self.llm_pipeline(
                         messages,
-                        max_new_tokens=150,
                         temperature=0.5,
+                        max_new_tokens=512,
                         do_sample=True,
+                        continue_final_message=True,
                     )
 
-                    llm_explanation = outputs[0]["generated_text"][-1]["content"].strip()
+                    raw_text = outputs[0]["generated_text"][-1]["content"].strip()
 
-                    line["semantic_metadata"]["humor_analysis"] = llm_explanation
+                    final_explanation = raw_text.replace("**", "").strip()
+
+                    final_explanation = final_explanation.split("EXPLICAÇÃO: ")[-1].strip()
+
+                    line["semantic_metadata"]["humor_analysis"] = final_explanation
                     logger.info(
-                        f"\033[95mAnnotated punchline at {line['start']:.2f}s: {llm_explanation[:50]}...\033[0m"
+                        f"\033[95mAnnotated punchline at {line['start']:.2f}s: {final_explanation[:50]}...\033[0m"
                     )
+
+                    print(raw_text)
 
                 except Exception as e:
                     line["semantic_metadata"]["humor_analysis"] = f"Local LLM Error: {str(e)}"
