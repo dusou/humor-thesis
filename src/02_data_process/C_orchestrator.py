@@ -302,22 +302,23 @@ class LusoLaughDatasetGenerator:
             logger.info("[DRY RUN] Skipping semantic LLM annotation.")
             return aligned_script
 
-        logger.info("Mapping laughs to punchlines and running Local LLM inference...")
+        logger.info("Starting semantic annotaion with LLM...")
+
+        last_punchline_idx = 0
 
         for i, line in enumerate(aligned_script):
             line["is_punchline"] = False
             line["semantic_metadata"] = {}
 
-            # Map laughs: If a laugh happens within 2.5 seconds of this line ending
+            # Map laughs: If a laugh happens within 1 second of this line ending
             for laugh in laughs:
-                if line["start"] <= laugh["start"] <= (line["end"] + 2.5):
+                if line["start"] <= laugh["start"] <= (line["end"] + 1):
                     line["is_punchline"] = True
                     break
 
             # If it is a punchline, ask the local LLM
             if line["is_punchline"]:
-                start_idx = max(0, i - 10)
-                context_lines = aligned_script[start_idx:i]
+                context_lines = aligned_script[last_punchline_idx:i]
 
                 context_list = []
                 for ctx_line in context_lines:
@@ -377,7 +378,9 @@ class LusoLaughDatasetGenerator:
                         f"\033[95mAnnotated punchline at {line['start']:.2f}s: {final_explanation[:50]}...\033[0m"
                     )
 
-                    print(raw_text)
+                    last_punchline_idx = i + 1
+
+                    print(prompt)
 
                 except Exception as e:
                     line["semantic_metadata"]["humor_analysis"] = f"Local LLM Error: {str(e)}"
