@@ -172,7 +172,6 @@ class LusoLaughDatasetGenerator:
 
         logger.info("Running AI Audio Classification for laughter detection...")
         try:
-            # 1. Load the RAW audio (bypass Demucs vocal stripping)
             y = whisperx.load_audio(audio_path)
             sr = 16000
 
@@ -180,7 +179,6 @@ class LusoLaughDatasetGenerator:
             step_samples = int(step_duration * sr)
             raw_laughs = []
 
-            # AudioSet actually has multiple classes for laughter!
             laugh_labels = ["Laughter", "Giggle", "Snicker", "Belly laugh", "Chuckle, chortle"]
 
             # 2. Overlapping sliding window
@@ -191,11 +189,10 @@ class LusoLaughDatasetGenerator:
                 if len(chunk) < sr:
                     continue
 
-                # 3. THE MAGIC FIX: top_k=20
-                # Forces the AI to give us its top 20 guesses, not just the top 5!
+                # Forces the AI to give us its top 20 guesses, not just the top 5
                 result = self.laughter_pipeline(chunk, top_k=20)
 
-                # Check if ANY of the laughter categories are in the top 20 with at least 5% confidence
+                # Check if any of the laughter categories are in the top 20 with at least 5% confidence
                 is_laugh = any(
                     pred["label"] in laugh_labels and pred["score"] > 0.05 for pred in result
                 )
@@ -225,7 +222,6 @@ class LusoLaughDatasetGenerator:
             return []
 
     def transcribe_and_diarize(self, vocals_path: str) -> list:
-        # IF DRY RUN: Return dummy script data
         if self.dry_run:
             logger.info("[DRY RUN] Skipping ASR and Diarization. Injecting dummy text.")
             return [

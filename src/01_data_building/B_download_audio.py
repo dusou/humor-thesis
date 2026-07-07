@@ -1,11 +1,14 @@
 import logging
 import os
 import pandas as pd
+from time import sleep
 import yt_dlp
 from yt_dlp.utils import download_range_func
 
 logging.basicConfig(
-    level=logging.INFO, format="%(asctime)s | %(levelname)-8s | %(message)s", datefmt="%Y-%m-%d %H:%M:%S"
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)-8s | %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
 )
 logger = logging.getLogger(__name__)
 
@@ -19,7 +22,9 @@ class LocalAudioIngestor:
         self.output_dir = output_dir
         os.makedirs(self.output_dir, exist_ok=True)
 
-    def ingest_audio(self, url: str, sketch_id: str, start_sec: float = 0.0, end_sec: float = None) -> str:
+    def ingest_audio(
+        self, url: str, sketch_id: str, start_sec: float = 0.0, end_sec: float = None
+    ) -> str:
         logger.info(f"Commencing automated ingestion for {sketch_id}...")
         save_path = os.path.join(self.output_dir, "{}.mp3".format(sketch_id))
 
@@ -58,7 +63,9 @@ if __name__ == "__main__":
     catalog_file = os.path.join(dirname, "../../data/01_catalogs/luso_laugh_catalog.csv")
 
     if not os.path.exists(catalog_file):
-        logger.error(f"Catalog file '{catalog_file}' not found. Please run the metadata extraction script first.")
+        logger.error(
+            f"Catalog file '{catalog_file}' not found. Please run the metadata extraction script first."
+        )
         exit()
 
     df = pd.read_csv(catalog_file)
@@ -88,7 +95,13 @@ if __name__ == "__main__":
             df.at[index, "status"] = "downloaded"  # Change status to mark it ready for the cluster
             logger.info(f"Successfully saved and updated status for {sketch_id}.")
         else:
-            logger.error(f"Failed to verify downloaded file for {sketch_id}. Status remains 'pending'.")
+            logger.error(
+                f"Failed to verify downloaded file for {sketch_id}. Status remains 'pending'."
+            )
+
+        if index % 10 == 0:
+            logger.info("Sleeping for 5 seconds to avoid API limits")
+            sleep(5)
 
     df.to_csv(catalog_file, index=False)  # Save progress immediately
 

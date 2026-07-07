@@ -6,7 +6,9 @@ import time
 import yt_dlp
 
 logging.basicConfig(
-    level=logging.INFO, format="%(asctime)s | %(levelname)-8s | %(message)s", datefmt="%Y-%m-%d %H:%M:%S"
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)-8s | %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
 )
 logger = logging.getLogger(__name__)
 
@@ -76,14 +78,18 @@ def build_channel_catalog(targets: list) -> pd.DataFrame:
                                 "start_time": 0.0,
                                 "end_time": end_time,
                                 "declared_language": final_lang,
-                                "channel_name": channel_info.get("uploader", channel_info.get("title")),
+                                "channel_name": channel_info.get(
+                                    "uploader", channel_info.get("title")
+                                ),
                                 "status": "pending",
                             }
                             all_videos.append(video_data)
                             entries_count += 1
 
                 elapsed = time.time() - start_time
-                logger.info(f"Successfully mapped {entries_count} videos from channel in {elapsed:.2f} seconds.")
+                logger.info(
+                    f"Successfully mapped {entries_count} videos from channel in {elapsed:.2f} seconds."
+                )
 
             except Exception as e:
                 logger.error(f"Failed to process {url}. Reason: {e}")
@@ -144,7 +150,9 @@ def clean_catalogue(df: pd.DataFrame) -> pd.DataFrame:
 if __name__ == "__main__":
     dirname = os.path.dirname(__file__)
     config_file = os.path.normpath(os.path.join(dirname, "../../config/source_channels.csv"))
-    output_csv = os.path.normpath(os.path.join(dirname, "../../data/01_catalogs/luso_laugh_catalog.csv"))
+    output_csv = os.path.normpath(
+        os.path.join(dirname, "../../data/01_catalogs/luso_laugh_catalog.csv")
+    )
 
     targets = load_targets_from_csv(config_file)
 
@@ -158,9 +166,6 @@ if __name__ == "__main__":
         # Preview the data
         logger.info("Previewing first 5 rows of the cleaned dataset:")
         print(clean_df.head())
-
-        # TODO: remove this (extract only 5 rows for testing purposes)
-        clean_df = clean_df.head()
 
         # Save to CSV to feed the main Luso-Laugh pipeline
         clean_df.to_csv(output_csv, index=False)
