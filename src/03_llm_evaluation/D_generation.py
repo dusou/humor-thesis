@@ -54,7 +54,7 @@ class StandaloneScriptEvaluator:
 
         if output_dir is None:
             self.output_dir = os.path.normpath(
-                os.path.join(script_dir, "../../data/04_eval_results")
+                os.path.join(script_dir, "../../data/04_eval_generations")
             )
         else:
             self.output_dir = output_dir
