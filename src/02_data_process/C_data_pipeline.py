@@ -397,8 +397,24 @@ if __name__ == "__main__":
 
     df = pd.read_csv(catalog_file)
 
+    total_count = len(df)
+    processed_count = len(df[df["status"] == "processed"])
     ready_sketches = df[df["status"] == "downloaded"]
-    logger.info(f"Found {len(ready_sketches)} sketches ready for AI processing.")
+    ready_count = len(ready_sketches)
+    pending_count = len(df[df["status"] == "pending"])
+
+    logger.info("\n" + "=" * 45)
+    logger.info("LUSO-LAUGH PIPELINE STATUS")
+    logger.info("=" * 45)
+    logger.info(f"Total sketches in catalog:\t\t{total_count}")
+    logger.info(f"Already processed:\t\t{processed_count}")
+    logger.info(f"Waiting for audio:\t\t{pending_count}")
+    logger.info(f"To process this run:\t\t{ready_count}")
+    logger.info("=" * 45 + "\n")
+
+    if ready_count == 0:
+        logger.info("No sketches are currently marked as 'downloaded'. Exiting.")
+        exit()
 
     output_dir = os.path.normpath(os.path.join(dirname, "../../data/02_audio_corpus/"))
     output_json_dir = os.path.normpath(os.path.join(dirname, "../../data/03_final_dataset/"))
