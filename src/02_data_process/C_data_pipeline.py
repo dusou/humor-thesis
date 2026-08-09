@@ -9,6 +9,7 @@ from omegaconf.listconfig import ListConfig
 import os
 import pandas as pd
 from pathlib import Path
+import re
 import shlex
 import shutil
 import torch
@@ -289,7 +290,12 @@ class LusoLaughDatasetGenerator:
                 REGRA CRÍTICA: Usa apenas vocabulário académico, formal e eufemismos educados na tua análise.
 
                 FORMATO OBRIGATÓRIO:
-                EXPLICAÇÃO: [Escreve a tua análise aqui]
+                <raciocinio>
+                [O raciocínio interno que motiva a tua explicação em menos de 10 frases]
+                </raciocinio>
+                <explicacao>
+                [A tua síntese formal do humor, no máximo 5 frases]
+                </explicacao>
                 """
 
                 messages = [
@@ -298,23 +304,36 @@ class LusoLaughDatasetGenerator:
                         "content": "You are a highly professional, polite, and academic AI analyzing Portuguese comedy. You strictly avoid profanity, slang, and vulgarity.",
                     },
                     {"role": "user", "content": prompt},
-                    {"role": "assistant", "content": "EXPLICAÇÃO:"},
+                    {"role": "assistant", "content": "<raciocinio>\n"},
                 ]
 
                 try:
                     outputs = self.llm_pipeline(
                         messages,
                         temperature=0.5,
-                        max_new_tokens=512,
+                        max_new_tokens=2084,
                         do_sample=True,
                         continue_final_message=True,
                     )
 
                     raw_text = outputs[0]["generated_text"][-1]["content"].strip()
+                    raw_text = f"<raciocinio>\n{raw_text}"
 
-                    final_explanation = raw_text.replace("**", "").strip()
+                    match = re.search(r"<explicacao>(.*?)</explicacao>", raw_text, re.DOTALL | re.IGNORECASE)
 
-                    final_explanation = final_explanation.split("EXPLICAÇÃO: ")[-1].strip()
+                    if match:
+                        final_explanation = match.group(1).strip()
+                    else:
+                        logger.warning(
+                            f"XML tags missing in LLM output for line at {line['start']}s. Raw text: {raw_text[:50]}"
+                        )
+                        # Safe fallback: take the whole string but try to strip out the raciocinio part if it exists
+                        final_explanation = re.sub(
+                            r"<raciocinio>.*?</raciocinio>", "", raw_text, flags=re.DOTALL | re.IGNORECASE
+                        ).strip()
+
+                    # Clean up any leftover markdown bolding the model might have added
+                    final_explanation = final_explanation.replace("**", "")
 
                     line["semantic_metadata"]["humor_analysis"] = final_explanation
                     logger.info(
@@ -322,8 +341,6 @@ class LusoLaughDatasetGenerator:
                     )
 
                     last_punchline_idx = i + 1
-
-                    print(prompt)
 
                 except Exception as e:
                     line["semantic_metadata"]["humor_analysis"] = f"Local LLM Error: {str(e)}"
@@ -388,9 +405,11 @@ if __name__ == "__main__":
 
     generator = LusoLaughDatasetGenerator(output_dir=output_dir, output_json_dir=output_json_dir)
 
-    for index, row in ready_sketches.iterrows():
+    total_sketches = len(ready_sketches)
+
+    for current_count, (index, row) in enumerate(ready_sketches.iterrows(), start=1):
         sketch_id = str(row["sketch_id"])
-        logger.info(f"\033[96m--- Processing Sketch ID: {sketch_id} ---\033[0m")
+        logger.info(f"\033[96m--- Processing Sketch ID: {sketch_id} ({current_count}/{total_sketches}) ---\033[0m")
 
         success = generator.process_sketch_remote(sketch_id)
 
