@@ -85,18 +85,15 @@ huggingface_hub.hf_hub_download = _patched_download
 class LusoLaughDatasetGenerator:
     """
     Master pipeline for constructing the Luso-Laugh computational humor corpus.
-    Includes a dry-run flag for local path and logic testing.
     """
 
     def __init__(
         self,
         output_dir="../../data/02_audio_corpus",
         output_json_dir="../../data/03_final_dataset",
-        dry_run=False,
     ):
         self.output_dir = output_dir
         self.output_json_dir = output_json_dir
-        self.dry_run = dry_run
 
         os.makedirs(self.output_dir, exist_ok=True)
         os.makedirs(self.output_json_dir, exist_ok=True)
@@ -105,20 +102,13 @@ class LusoLaughDatasetGenerator:
         self.compute_type = "float16" if self.device == "cuda" else "int8"
 
         self.hf_token = os.getenv("HF_TOKEN")
-        if not self.hf_token and not self.dry_run:
+        if not self.hf_token:
             raise ValueError("HF_TOKEN environment variable is missing. Check your .env file.")
 
         self._init_models()
 
     def _init_models(self):
-        # IF DRY RUN: Skip all heavy model initializations
-        if self.dry_run:
-            logger.info("DRY RUN MODE ACTIVE: Skipping neural pipeline initialization.")
-            return
-
-        logger.info(
-            f"Verified environment. Neural models will be loaded dynamically on {self.device.upper()}."
-        )
+        logger.info(f"Verified environment. Neural models will be loaded dynamically on {self.device.upper()}.")
 
         logger.info("Loading MIT AudioSet Transformer for laughter detection...")
         try:
@@ -148,14 +138,6 @@ class LusoLaughDatasetGenerator:
         base_name = os.path.splitext(os.path.basename(audio_path))[0]
         stem_dir = os.path.join(out_dir, "htdemucs", base_name)
 
-        # IF DRY RUN: Skip processing but return the paths that *would* be created
-        if self.dry_run:
-            logger.info(f"[DRY RUN] Skipping HTDemucs source separation for {sketch_id}.")
-            return {
-                "vocals": os.path.join(stem_dir, "vocals.wav"),
-                "accompaniment": os.path.join(stem_dir, "no_vocals.wav"),
-            }
-
         logger.info(f"Executing HTDemucs source separation for {sketch_id}...")
         cmd = f'--two-stems vocals -n htdemucs -j 8 --out "{out_dir}" "{audio_path}"'
         demucs.separate.main(shlex.split(cmd))
@@ -166,10 +148,6 @@ class LusoLaughDatasetGenerator:
         }
 
     def detect_laughter(self, audio_path: str, chunk_duration=3.0, step_duration=2.0) -> list:
-        if self.dry_run or not self.laughter_pipeline:
-            logger.info("[DRY RUN] Skipping neural punchline mapping.")
-            return [{"start": 10.0, "end": 12.0}]
-
         logger.info("Running AI Audio Classification for laughter detection...")
         try:
             y = whisperx.load_audio(audio_path)
@@ -181,21 +159,19 @@ class LusoLaughDatasetGenerator:
 
             laugh_labels = ["Laughter", "Giggle", "Snicker", "Belly laugh", "Chuckle, chortle"]
 
-            # 2. Overlapping sliding window
-            # It grabs 3 seconds of audio, but only moves forward 2 seconds each time
+            # Overlapping Sliding Window
+            # Grabs 3 seconds of audio, but only moves forward 2 seconds each time
             for i in range(0, len(y), step_samples):
                 chunk = y[i : i + chunk_samples]
 
                 if len(chunk) < sr:
                     continue
 
-                # Forces the AI to give us its top 20 guesses, not just the top 5
+                # Top 20 detections
                 result = self.laughter_pipeline(chunk, top_k=20)
 
                 # Check if any of the laughter categories are in the top 20 with at least 5% confidence
-                is_laugh = any(
-                    pred["label"] in laugh_labels and pred["score"] > 0.05 for pred in result
-                )
+                is_laugh = any(pred["label"] in laugh_labels and pred["score"] > 0.05 for pred in result)
 
                 if is_laugh:
                     start_time = i / sr
@@ -209,7 +185,7 @@ class LusoLaughDatasetGenerator:
                     merged_laughs.append(laugh)
                 else:
                     last = merged_laughs[-1]
-                    if laugh["start"] - last["end"] <= 1.5:
+                    if laugh["start"] - last["end"] <= 2:
                         last["end"] = max(last["end"], laugh["end"])
                     else:
                         merged_laughs.append(laugh)
@@ -222,26 +198,11 @@ class LusoLaughDatasetGenerator:
             return []
 
     def transcribe_and_diarize(self, vocals_path: str) -> list:
-        if self.dry_run:
-            logger.info("[DRY RUN] Skipping ASR and Diarization. Injecting dummy text.")
-            return [
-                {
-                    "speaker": "SPEAKER_TEST",
-                    "text": "Dry run verification successful.",
-                    "start": 0.0,
-                    "end": 2.0,
-                }
-            ]
-
         logger.info("Executing WhisperX Transcription...")
-
-        # 1. Load Audio
         audio = whisperx.load_audio(vocals_path)
 
-        # 2. Transcribe
-        model = whisperx.load_model(
-            "large-v3", self.device, compute_type=self.compute_type, language="pt"
-        )
+        # Transcribe
+        model = whisperx.load_model("large-v3", self.device, compute_type=self.compute_type, language="pt")
         result = model.transcribe(audio, batch_size=16, language="pt")
 
         # Free memory
@@ -249,25 +210,19 @@ class LusoLaughDatasetGenerator:
         gc.collect()
         torch.cuda.empty_cache()
 
-        # 3. Align
+        # Align
         logger.info(f"Aligning word-level timestamps for language: {result['language']}...")
-        model_a, metadata = whisperx.load_align_model(
-            language_code=result["language"], device=self.device
-        )
-        result = whisperx.align(
-            result["segments"], model_a, metadata, audio, self.device, return_char_alignments=False
-        )
+        model_a, metadata = whisperx.load_align_model(language_code=result["language"], device=self.device)
+        result = whisperx.align(result["segments"], model_a, metadata, audio, self.device, return_char_alignments=False)
 
         # Free memory
         del model_a
         gc.collect()
         torch.cuda.empty_cache()
 
-        # 4. Diarize
+        # Diarize
         logger.info("Executing Speaker Diarization...")
-        diarize_model = whisperx.diarize.DiarizationPipeline(
-            use_auth_token=self.hf_token, device=self.device
-        )
+        diarize_model = whisperx.diarize.DiarizationPipeline(use_auth_token=self.hf_token, device=self.device)
         diarize_segments = diarize_model(audio)
 
         # Free memory
@@ -275,11 +230,11 @@ class LusoLaughDatasetGenerator:
         gc.collect()
         torch.cuda.empty_cache()
 
-        # 5. Merge
+        # Merge
         logger.info("Assigning precise timestamps to speakers...")
         final_result = whisperx.assign_word_speakers(diarize_segments, result)
 
-        # 6. Format to match corpus schema
+        # Format to match corpus schema
         aligned_script = []
         for segment in final_result["segments"]:
             aligned_script.append(
@@ -294,10 +249,6 @@ class LusoLaughDatasetGenerator:
         return aligned_script
 
     def annotate_irony(self, aligned_script: list, laughs: list) -> list:
-        if self.dry_run or not self.llm_pipeline:
-            logger.info("[DRY RUN] Skipping semantic LLM annotation.")
-            return aligned_script
-
         logger.info("Starting semantic annotaion with LLM...")
 
         last_punchline_idx = 0
@@ -308,11 +259,11 @@ class LusoLaughDatasetGenerator:
 
             # Map laughs: If a laugh happens within 1 second of this line ending
             for laugh in laughs:
-                if line["start"] <= laugh["start"] <= (line["end"] + 1):
+                if line["start"] <= laugh["start"] <= (line["end"] + 2):
                     line["is_punchline"] = True
                     break
 
-            # If it is a punchline, ask the local LLM
+            # If it is a punchline, prompt LLM for explanation
             if line["is_punchline"]:
                 context_lines = aligned_script[last_punchline_idx:i]
 
@@ -322,10 +273,7 @@ class LusoLaughDatasetGenerator:
                     text = ctx_line.get("text", "")
                     context_list.append(f"[{speaker}]: {text}")
 
-                # Join them together with newlines
                 context = "\n".join(context_list)
-
-                # Identify the current punchline's speaker
                 current_speaker = line.get("speaker", "UNKNOWN")
 
                 prompt = f"""
@@ -344,7 +292,6 @@ class LusoLaughDatasetGenerator:
                 EXPLICAÇÃO: [Escreve a tua análise aqui]
                 """
 
-                # 1. Give the System a strict, professional persona
                 messages = [
                     {
                         "role": "system",
@@ -380,9 +327,7 @@ class LusoLaughDatasetGenerator:
 
                 except Exception as e:
                     line["semantic_metadata"]["humor_analysis"] = f"Local LLM Error: {str(e)}"
-                    logger.warning(
-                        f"Failed to generate annotation for line at {line['start']:.2f}s."
-                    )
+                    logger.warning(f"Failed to generate annotation for line at {line['start']:.2f}s.")
 
         return aligned_script
 
@@ -396,8 +341,7 @@ class LusoLaughDatasetGenerator:
             logger.error(f"Audio file missing for {sketch_id}. Skipping.")
             return False
 
-        mode_text = "[DRY RUN]" if self.dry_run else "GPU Processing"
-        logger.info(f"Commencing {mode_text} for {sketch_id}...")
+        logger.info(f"Commencing processing for {sketch_id}...")
 
         try:
             # stems = self.separate_sources(audio_path, sketch_id)
@@ -411,10 +355,10 @@ class LusoLaughDatasetGenerator:
 
             logger.info(f"Luso-Laugh corpus entry serialized to {out_file}")
 
-            if not self.dry_run:
-                sketch_demucs_folder = os.path.join(self.output_dir, sketch_id)
-                if os.path.isdir(sketch_demucs_folder):
-                    shutil.rmtree(sketch_demucs_folder)
+            sketch_demucs_folder = os.path.join(self.output_dir, sketch_id)
+            if os.path.isdir(sketch_demucs_folder):
+                shutil.rmtree(sketch_demucs_folder)
+
             return True
 
         except Exception as e:
@@ -425,11 +369,6 @@ class LusoLaughDatasetGenerator:
 # === Execution Loop ===
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="LusoLaugh Remote Orchestrator")
-    parser.add_argument(
-        "--dry-run",
-        action="store_true",
-        help="Run the pipeline logic without loading or executing ML models.",
-    )
     args = parser.parse_args()
 
     dirname = os.path.dirname(__file__)
@@ -447,9 +386,7 @@ if __name__ == "__main__":
     output_dir = os.path.normpath(os.path.join(dirname, "../../data/02_audio_corpus/"))
     output_json_dir = os.path.normpath(os.path.join(dirname, "../../data/03_final_dataset/"))
 
-    generator = LusoLaughDatasetGenerator(
-        dry_run=args.dry_run, output_dir=output_dir, output_json_dir=output_json_dir
-    )
+    generator = LusoLaughDatasetGenerator(output_dir=output_dir, output_json_dir=output_json_dir)
 
     for index, row in ready_sketches.iterrows():
         sketch_id = str(row["sketch_id"])
@@ -458,9 +395,5 @@ if __name__ == "__main__":
         success = generator.process_sketch_remote(sketch_id)
 
         if success:
-            if not args.dry_run:
-                # Only save to the CSV if this is a real run
-                df.at[index, "status"] = "processed"
-                df.to_csv(catalog_file, index=False)
-            else:
-                logger.info(f"[DRY RUN] Status for {sketch_id} kept as 'downloaded'.")
+            df.at[index, "status"] = "processed"
+            df.to_csv(catalog_file, index=False)
