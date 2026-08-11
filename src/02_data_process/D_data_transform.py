@@ -109,16 +109,12 @@ class TrainingDataFormatter:
         for the given sketch transcript to be used in the Macro LoRA task.
         """
         speakers = list(set([line.get("speaker", "UNKNOWN") for line in data]))
-        fallback_summary = (
-            f"Um sketch de comédia portuguesa envolvendo uma interação entre {', '.join(speakers)}."
-        )
+        fallback_summary = f"Um sketch de comédia portuguesa envolvendo uma interação entre {', '.join(speakers)}."
 
         if self.dry_run or not self.llm_pipeline:
             return fallback_summary
 
-        transcript_lines = [
-            f"[{line.get('speaker', 'UNKNOWN')}]: {line.get('text', '')}" for line in data
-        ]
+        transcript_lines = [f"[{line.get('speaker', 'UNKNOWN')}]: {line.get('text', '')}" for line in data]
         full_transcript = "\n".join(transcript_lines)
 
         prompt = f"""
@@ -148,7 +144,7 @@ class TrainingDataFormatter:
             outputs = self.llm_pipeline(
                 messages,
                 temperature=0.7,
-                max_new_tokens=1024,
+                max_new_tokens=2048,
                 do_sample=True,
                 continue_final_message=True,
             )
@@ -193,17 +189,12 @@ class TrainingDataFormatter:
                         continue
 
                     context_str = "\n".join(
-                        [
-                            f"[{c.get('speaker', 'UNKNOWN')}]: {c.get('text', '')}"
-                            for c in context_lines
-                        ]
+                        [f"[{c.get('speaker', 'UNKNOWN')}]: {c.get('text', '')}" for c in context_lines]
                     )
                     current_speaker = line.get("speaker", "UNKNOWN")
                     punchline_text = line.get("text", "")
 
-                    output_str = (
-                        f"[Raciocínio] {analysis} [Punchline] [{current_speaker}]: {punchline_text}"
-                    )
+                    output_str = f"[Raciocínio] {analysis} [Punchline] [{current_speaker}]: {punchline_text}"
 
                     lora_entry = {
                         "instruction": instruction,
@@ -216,7 +207,9 @@ class TrainingDataFormatter:
             # ==========================================
             # TASK B: MACRO (Context Expansion)
             # ==========================================
-            instruction = "Write a complete Portuguese comedy sketch based on the following premise and stylistic direction."
+            instruction = (
+                "Write a complete Portuguese comedy sketch based on the following premise and stylistic direction."
+            )
 
             summary_input = self._generate_synthetic_summary(sketch_id, data)
             full_transcript = "\n".join(
@@ -230,31 +223,25 @@ class TrainingDataFormatter:
             }
             lora_file.write(json.dumps(lora_entry, ensure_ascii=False) + "\n")
 
-    def run(self):
-        if not self.input_dir.exists():
-            logger.error(f"Input directory {self.input_dir} not found.")
-            return
+    def process_sketch(self, filepath: Path):
+        """Processes a single sketch and saves its RAG and LoRA representations."""
+        sketch_id = filepath.name.replace("_annotated.json", "")
 
-        json_files = list(self.input_dir.glob("*_annotated.json"))
-        logger.info(f"Found {len(json_files)} annotated sketches to process.")
+        with open(filepath, "r", encoding="utf-8") as f:
+            try:
+                data = json.load(f)
+            except json.JSONDecodeError:
+                logger.error(f"Failed to parse {filepath.name}. Skipping.")
+                return False
 
-        with open(self.lora_output_file, "w", encoding="utf-8") as lora_f:
-            for filepath in json_files:
-                sketch_id = filepath.name.replace("_annotated.json", "")
+        # RAG adaptation
+        self.format_for_rag(sketch_id, data)
 
-                with open(filepath, "r", encoding="utf-8") as f:
-                    try:
-                        data = json.load(f)
-                    except json.JSONDecodeError:
-                        logger.error(f"Failed to parse {filepath.name}. Skipping.")
-                        continue
+        # LORA JSONL adaptation
+        with open(self.lora_output_file, "a", encoding="utf-8") as lora_f:
+            self.format_for_lora(sketch_id, data, lora_f)
 
-                self.format_for_rag(sketch_id, data)
-                self.format_for_lora(sketch_id, data, lora_f)
-
-        logger.info("Transformation complete.")
-        logger.info(f"RAG files saved to: {self.rag_output_dir}")
-        logger.info(f"LoRA JSONL saved to: {self.lora_output_file}")
+        return True
 
 
 if __name__ == "__main__":
@@ -265,14 +252,53 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     dirname = os.path.dirname(__file__)
-    input_dir = os.path.normpath(os.path.join(dirname, "../../data/03_final_dataset/"))
-    rag_output_dir = os.path.normpath(os.path.join(dirname, "../../data/04_rag_ready/"))
-    lora_output_dir = os.path.normpath(os.path.join(dirname, "../../data/04_lora_ready/"))
+    input_dir = Path(os.path.normpath(os.path.join(dirname, "../../data/03_final_dataset/")))
+    rag_output_dir = Path(os.path.normpath(os.path.join(dirname, "../../data/04_rag_ready/")))
+    lora_output_dir = Path(os.path.normpath(os.path.join(dirname, "../../data/04_lora_ready/")))
+
+    input_dir.mkdir(parents=True, exist_ok=True)
+    rag_output_dir.mkdir(parents=True, exist_ok=True)
+    lora_output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Find all source files
+    input_files = list(input_dir.glob("*_annotated.json"))
+
+    # Check which ones have already been generated in the RAG folder
+    processed_files = list(rag_output_dir.glob("*_rag.json"))
+    processed_ids = set(f.name.replace("_rag.json", "") for f in processed_files)
+
+    # Filter down to only what is missing
+    pending_files = [f for f in input_files if f.name.replace("_annotated.json", "") not in processed_ids]
+
+    total_count = len(input_files)
+    processed_count = len(processed_ids)
+    ready_count = len(pending_files)
+
+    logger.info("=" * 45)
+    logger.info("LUSO-LAUGH TRANSFORM PIPELINE STATUS")
+    logger.info("=" * 45)
+    logger.info(f"Total annotated sketches:\t{total_count}")
+    logger.info(f"Already transformed:\t\t{processed_count}")
+    logger.info(f"To process this run:\t\t{ready_count}")
+    logger.info("=" * 45)
+
+    if ready_count == 0:
+        logger.info("No sketches are currently pending transformation. Exiting.")
+        exit()
 
     formatter = TrainingDataFormatter(
         dry_run=args.dry_run,
-        input_dir=input_dir,
-        rag_output_dir=rag_output_dir,
-        lora_output_dir=lora_output_dir,
+        input_dir=str(input_dir),
+        rag_output_dir=str(rag_output_dir),
+        lora_output_dir=str(lora_output_dir),
     )
-    formatter.run()
+
+    for current_count, filepath in enumerate(pending_files, start=1):
+        sketch_id = filepath.name.replace("_annotated.json", "")
+
+        logger.info(f"\033[96m--- Transforming Sketch ID: {sketch_id} ({current_count}/{ready_count}) ---\033[0m")
+        formatter.process_sketch(filepath)
+
+    logger.info("Transformation complete.")
+    logger.info(f"RAG files saved to: {rag_output_dir}")
+    logger.info(f"LoRA JSONL saved to: {formatter.lora_output_file}")

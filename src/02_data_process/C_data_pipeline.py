@@ -403,14 +403,14 @@ if __name__ == "__main__":
     ready_count = len(ready_sketches)
     pending_count = len(df[df["status"] == "pending"])
 
-    logger.info("\n" + "=" * 45)
+    logger.info("=" * 45)
     logger.info("LUSO-LAUGH PIPELINE STATUS")
     logger.info("=" * 45)
     logger.info(f"Total sketches in catalog:\t\t{total_count}")
     logger.info(f"Already processed:\t\t{processed_count}")
     logger.info(f"Waiting for audio:\t\t{pending_count}")
     logger.info(f"To process this run:\t\t{ready_count}")
-    logger.info("=" * 45 + "\n")
+    logger.info("=" * 45)
 
     if ready_count == 0:
         logger.info("No sketches are currently marked as 'downloaded'. Exiting.")
