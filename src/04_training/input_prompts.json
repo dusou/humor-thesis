@@ -1,0 +1,62 @@
+[
+    {
+        "theme": "bureaucracy",
+        "format": "sketch",
+        "prompt": "Uma fila de espera interminável numa repartição pública das Finanças onde o funcionário é excessivamente zeloso com carimbos."
+    },
+    {
+        "theme": "politics",
+        "format": "sketch",
+        "prompt": "Um debate autárquico numa pequena vila do interior de Portugal onde os candidatos prometem coisas absurdas para ganhar votos."
+    },
+    {
+        "theme": "football",
+        "format": "sketch",
+        "prompt": "Dois adeptos de futebol rivais que são forçados a assistir a um derby importante juntos porque ficaram presos num elevador."
+    },
+    {
+        "theme": "sketch tema livre",
+        "format": "sketch",
+        "prompt": "Um tema livre à tua escolha que esteja assente na realidade moderna do público português."
+    },
+    {
+        "theme": "eclipse solar 2026",
+        "format": "tv_show",
+        "prompt": "Um monólogo de late-night sobre o caos do eclipse solar de 12 de agosto de 2026. O apresentador satiriza a histeria nacional e o facto de milhares de pessoas terem entupido as estradas para Bragança apenas para ver 26 segundos de escuridão total, enquanto o resto do país tentava olhar para o sol com radiografias velhas."
+    },
+    {
+        "theme": "crise da habitação",
+        "format": "tv_show",
+        "prompt": "Um segmento humorístico de televisão a comentar os preços imobiliários absurdos em Lisboa e no Porto, focando-se num anúncio real de um 'T0 acolhedor' que é basicamente uma despensa com uma sanita ao lado do micro-ondas, arrendado a nómadas digitais."
+    },
+    {
+        "theme": "febre do padel",
+        "format": "tv_show",
+        "prompt": "Um sketch televisivo disfarçado de documentário sobre a 'epidemia' de Padel em Portugal, onde homens de meia-idade subitamente gastam fortunas em raquetes e equipamento fluorescente, tratando um jogo amigável de domingo como se fosse a final da Liga dos Campeões."
+    },
+    {
+        "theme": "tv_show tema livre",
+        "format": "tv_show",
+        "prompt": "Um tema livre à tua escolha que esteja assente na realidade moderna do público português."
+    },
+    {
+        "theme": "obras públicas",
+        "format": "newspaper",
+        "prompt": "Uma crónica satírica sobre a novela interminável da escolha da localização do novo aeroporto de Lisboa, sugerindo soluções cada vez mais absurdas, como construir a pista em cima da Ponte 25 de Abril ou usar o relvado do Estádio da Luz."
+    },
+    {
+        "theme": "verão no Algarve",
+        "format": "newspaper",
+        "prompt": "Um artigo de opinião humorístico sobre as regras não escritas das férias no Algarve em agosto, desde a guerra pelas sombras na praia às 7 da manhã, até aos vendedores de Bolas de Berlim que agora recusam trocos e exigem pagamento por MB Way."
+    },
+    {
+        "theme": "saúde pública",
+        "format": "newspaper",
+        "prompt": "Uma crónica irónica sobre a odisseia épica que é tentar ser atendido nas urgências do SNS durante o inverno, onde o tempo de espera é tão longo que os pacientes formam pequenas comunidades autossuficientes nas salas de triagem e o paracetamol é tratado como a poção mágica para todas as doenças."
+    },
+    {
+        "theme": "newspaper tema livre",
+        "format": "newspaper",
+        "prompt": "Um tema livre à tua escolha que esteja assente na realidade moderna do público português."
+    }
+]
