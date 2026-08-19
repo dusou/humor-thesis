@@ -2,13 +2,10 @@ import argparse
 import json
 from langchain_chroma import Chroma
 from langchain_core.documents import Document
-from langchain_core.output_parsers import StrOutputParser
-from langchain_core.prompts import PromptTemplate
-from langchain_huggingface import HuggingFaceEmbeddings, HuggingFacePipeline
+from langchain_huggingface import HuggingFaceEmbeddings
 import logging
 import os
 from pathlib import Path
-import re
 import torch
 import transformers
 
@@ -34,7 +31,7 @@ class ComediaRAG:
         self,
         corpus_dir: str = "../../data/04_rag_ready",
         llm_model_name: str = "Qwen/Qwen3.5-9B",
-        embedder_model_name: str = "rufimelo/bert-large-portuguese-cased-sts",
+        embedder_model_name: str = "BAAI/bge-m3",
         dry_run: bool = False,
     ):
         self.corpus_dir = Path(corpus_dir)
@@ -46,10 +43,9 @@ class ComediaRAG:
         self.hf_token = os.getenv("HF_TOKEN")
 
         self.vector_store = None
-        self.llm_chain = None
 
         self._build_vector_store(embedder_model_name)
-        self._init_llm_chain(llm_model_name)
+        self._init_chain(llm_model_name)
 
     def _build_vector_store(self, embedder_model_name: str):
         """Loads JSON files, wraps them in LangChain Documents, and ingests them into ChromaDB."""
@@ -84,9 +80,11 @@ class ComediaRAG:
         )
 
         logger.info("Ingesting documents into ephemeral ChromaDB...")
-        self.vector_store = Chroma.from_documents(documents=lc_documents, embedding=embeddings)
+        self.vector_store = Chroma.from_documents(
+            documents=lc_documents, embedding=embeddings, collection_metadata={"hnsw:space": "cosine"}
+        )
 
-    def _init_llm_chain(self, llm_model_name: str):
+    def _init_chain(self, llm_model_name: str):
         """Initializes Qwen-3.5-9B and constructs a decoupled LCEL chain."""
         if self.dry_run:
             logger.info("DRY RUN: Skipping Qwen LLM initialization.")
@@ -94,40 +92,60 @@ class ComediaRAG:
 
         logger.info(f"Loading Generative LLM: {llm_model_name}...")
         try:
-            hf_pipeline = transformers.pipeline(
-                "text-generation",
-                model=llm_model_name,
+            self.tokenizer = transformers.AutoTokenizer.from_pretrained(llm_model_name, token=self.hf_token)
+            self.model = transformers.AutoModelForCausalLM.from_pretrained(
+                llm_model_name,
                 dtype=self.compute_type,
                 device_map="auto",
                 token=self.hf_token,
-                max_new_tokens=4098,
-                temperature=0.8,
-                do_sample=True,
-                return_full_text=False,
             )
-
-            langchain_llm = HuggingFacePipeline(pipeline=hf_pipeline)
-
-            template = """<|im_start|>system
-                        {system_instruction} 
-                        Abaixo estão exemplos de humor português para servirem de inspiração estilística. 
-                        Usa o mesmo tom, ritmo, ironia e vocabulário para escrever o novo texto.
-
-                        IMPORTANTE: Responde APENAS com o texto final pedido. Não incluas o teu processo de raciocínio, notas, introduções ou tags internas.<|im_end|>
-                        <|im_start|>user
-                        {context}
-
-                        Com base na inspiração acima, {task_instruction}: {query}<|im_end|>
-                        <|im_start|>assistant
-                        """
-            prompt = PromptTemplate.from_template(template)
-            self.llm_chain = prompt | langchain_llm | StrOutputParser()
-
         except Exception as e:
             logger.error(f"Failed to load Generative LLM: {e}")
-            self.llm_chain = None
+            self.model = None
 
-    def generate_satire(self, query: str, format_type: str = "sketch") -> dict:
+    def _generate_bounded(self, messages, reasoning_budget=1200, answer_budget=2500):
+        """Two bounded phases: capped reasoning, then a guaranteed answer budget."""
+        prompt = self.tokenizer.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True, enable_thinking=True
+        )
+        inputs = self.tokenizer(prompt, return_tensors="pt").to(self.model.device)
+
+        # Phase 1: reasoning
+        out1 = self.model.generate(
+            **inputs,
+            max_new_tokens=reasoning_budget,
+            do_sample=True,
+            temperature=0.8,
+        )
+        reasoning_text = self.tokenizer.decode(out1[0, inputs["input_ids"].shape[1] :], skip_special_tokens=False)
+
+        if "</think>" not in reasoning_text:
+            logger.info("Reasoning hit its budget before closing naturally; forcing closure.")
+            reasoning_text = reasoning_text.split("<think>")[-1]
+            reasoning_text = "<think>" + reasoning_text + "\n</think>\n\n"
+
+        # Phase 2: answer
+        inputs2 = self.tokenizer(prompt + reasoning_text, return_tensors="pt").to(self.model.device)
+        out2 = self.model.generate(
+            **inputs2,
+            max_new_tokens=answer_budget,
+            do_sample=True,
+            temperature=0.8,
+            repetition_penalty=1.1,
+        )
+        answer_text = self.tokenizer.decode(out2[0, inputs2["input_ids"].shape[1] :], skip_special_tokens=True)
+
+        # --- MEMORY CLEANUP ---
+        del inputs, out1, inputs2, out2
+        import gc
+
+        gc.collect()
+        torch.cuda.empty_cache()
+        # --------------------------------
+
+        return reasoning_text, answer_text.strip()
+
+    def generate(self, query: str, format_type: str = "sketch") -> dict:
         """Executes the RAG chain, dynamically injecting instructions and returning full context."""
 
         FORMAT_MAPPING = {
@@ -147,25 +165,31 @@ class ComediaRAG:
 
         instructions = FORMAT_MAPPING.get(format_type, FORMAT_MAPPING["sketch"])
 
-        if self.dry_run or not self.llm_chain:
+        if self.dry_run:
             return {"text": f"[DRY RUN] Generated mock {format_type} output.", "sources": []}
 
         try:
             # explicitly retrieve the documents
-            retriever = self.vector_store.as_retriever(search_kwargs={"k": 3})
-            docs = retriever.invoke(query)
+            docs_with_scores = self.vector_store.similarity_search_with_score(query, k=3)
+
+            SCORE_THRESHOLD = 2
+            filtered = [(doc, score) for doc, score in docs_with_scores if score <= SCORE_THRESHOLD]
 
             # extract IDs and actual text
             retrieved_contexts = []
             retrieved_ids = []
-            for doc in docs:
+            for doc, score in filtered:
+                logger.info(
+                    f'\tscore={score:.4f} // id={doc.metadata["sketch_id"]} // preview="{doc.metadata["clean_content"][:50]}"'
+                )
+
                 s_id = doc.metadata.get("sketch_id", "UNKNOWN")
                 s_text = doc.metadata.get("clean_content", "")
 
                 retrieved_ids.append(s_id)
                 retrieved_contexts.append({"sketch_id": s_id, "text": s_text})
 
-            logger.info(f"   -> Retrieved source sketches: {retrieved_ids}")
+            docs = [doc for doc, _ in filtered]
 
             # format the documents into a string context for the LLM Prompt
             formatted_context = ""
@@ -174,18 +198,25 @@ class ComediaRAG:
                     f"--- EXEMPLO {i} ({doc.metadata['sketch_id']}) ---\n{doc.metadata['clean_content']}\n"
                 )
 
-            response = self.llm_chain.invoke(
-                {
-                    "context": formatted_context,
-                    "query": query,
-                    "system_instruction": instructions["system_instruction"],
-                    "task_instruction": instructions["task_instruction"],
-                }
-            )
+            if filtered:
+                messages = [
+                    {"role": "system", "content": f"{instructions['system_instruction']}\n..."},
+                    {
+                        "role": "user",
+                        "content": f"{formatted_context}\n\nCom base na inspiração acima, {instructions['task_instruction']}: {query}",
+                    },
+                ]
+            else:
+                messages = [
+                    {"role": "system", "content": f"{instructions['system_instruction']}\n..."},
+                    {
+                        "role": "user",
+                        "content": f"{instructions['task_instruction']}: {query}",
+                    },
+                ]
+                logger.warning(f"No sufficiently relevant sketches found for query: {query[:60]}...")
 
-            # clean thinking tags and artifacts
-            clean_response = re.sub(r"<think>.*?</think>", "", response, flags=re.DOTALL)
-            clean_response = clean_response.replace("assistant\n", "").strip()
+            reasoning, clean_response = self._generate_bounded(messages, reasoning_budget=2500, answer_budget=3500)
 
             return {"text": clean_response, "sources": retrieved_contexts}
 
@@ -230,7 +261,7 @@ if __name__ == "__main__":
 
         logger.info(f"Processing ({idx}/{total_items}) // Theme: '{theme}' // Format: '{format_type}'")
 
-        generation_result = rag_system.generate_satire(query=prompt, format_type=format_type)
+        generation_result = rag_system.generate(query=prompt, format_type=format_type)
 
         output_data.append(
             {
