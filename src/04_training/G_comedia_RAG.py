@@ -1,4 +1,5 @@
 import argparse
+import gc
 import json
 from langchain_chroma import Chroma
 from langchain_core.documents import Document
@@ -20,6 +21,7 @@ logger = logging.getLogger(__name__)
 # Reduce transformer warnings
 transformers.logging.set_verbosity_error()
 os.environ["HF_HUB_DISABLE_TELEMETRY"] = "1"
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 
 class ComediaRAG:
@@ -73,7 +75,7 @@ class ComediaRAG:
                 logger.warning(f"Failed to load {filepath.name}: {e}")
 
         logger.info(f"Initializing HuggingFace Embeddings ({embedder_model_name})...")
-        embeddings = HuggingFaceEmbeddings(
+        gpu_embeddings = HuggingFaceEmbeddings(
             model_name=embedder_model_name,
             model_kwargs={"device": self.device},
             encode_kwargs={"normalize_embeddings": True},
@@ -81,7 +83,19 @@ class ComediaRAG:
 
         logger.info("Ingesting documents into ephemeral ChromaDB...")
         self.vector_store = Chroma.from_documents(
-            documents=lc_documents, embedding=embeddings, collection_metadata={"hnsw:space": "cosine"}
+            documents=lc_documents, embedding=gpu_embeddings, collection_metadata={"hnsw:space": "cosine"}
+        )
+
+        del gpu_embeddings
+        gc.collect()
+        torch.cuda.empty_cache()
+
+        # swap in a lightweight CPU embedder for query-time use during generation
+        logger.info("Swapping to CPU embeddings for query-time retrieval...")
+        self.vector_store._embedding_function = HuggingFaceEmbeddings(
+            model_name=embedder_model_name,
+            model_kwargs={"device": "cpu"},
+            encode_kwargs={"normalize_embeddings": True},
         )
 
     def _init_chain(self, llm_model_name: str):
@@ -98,50 +112,58 @@ class ComediaRAG:
                 dtype=self.compute_type,
                 device_map="auto",
                 token=self.hf_token,
+                attn_implementation="sdpa",
             )
         except Exception as e:
             logger.error(f"Failed to load Generative LLM: {e}")
             self.model = None
 
-    def _generate_bounded(self, messages, reasoning_budget=1200, answer_budget=2500):
+    def _generate_bounded(self, messages, reasoning_budget=3000, answer_budget=1500):
         """Two bounded phases: capped reasoning, then a guaranteed answer budget."""
         prompt = self.tokenizer.apply_chat_template(
             messages, tokenize=False, add_generation_prompt=True, enable_thinking=True
         )
         inputs = self.tokenizer(prompt, return_tensors="pt").to(self.model.device)
 
-        # Phase 1: reasoning
-        out1 = self.model.generate(
-            **inputs,
-            max_new_tokens=reasoning_budget,
-            do_sample=True,
-            temperature=0.8,
-        )
-        reasoning_text = self.tokenizer.decode(out1[0, inputs["input_ids"].shape[1] :], skip_special_tokens=False)
+        try:  # Phase 1 : reason
+            with torch.inference_mode():
+                out1 = self.model.generate(
+                    **inputs,
+                    max_new_tokens=reasoning_budget,
+                    do_sample=True,
+                    temperature=0.8,
+                    repetition_penalty=1.1,
+                    top_p=0.9,
+                )
+            reasoning_text = self.tokenizer.decode(out1[0, inputs["input_ids"].shape[1] :], skip_special_tokens=False)
+        finally:  # Memory Cleanup
+            del inputs
+            gc.collect()
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
 
         if "</think>" not in reasoning_text:
             logger.info("Reasoning hit its budget before closing naturally; forcing closure.")
             reasoning_text = reasoning_text.split("<think>")[-1]
             reasoning_text = "<think>" + reasoning_text + "\n</think>\n\n"
 
-        # Phase 2: answer
         inputs2 = self.tokenizer(prompt + reasoning_text, return_tensors="pt").to(self.model.device)
-        out2 = self.model.generate(
-            **inputs2,
-            max_new_tokens=answer_budget,
-            do_sample=True,
-            temperature=0.8,
-            repetition_penalty=1.1,
-        )
-        answer_text = self.tokenizer.decode(out2[0, inputs2["input_ids"].shape[1] :], skip_special_tokens=True)
-
-        # --- MEMORY CLEANUP ---
-        del inputs, out1, inputs2, out2
-        import gc
-
-        gc.collect()
-        torch.cuda.empty_cache()
-        # --------------------------------
+        try:  # Phase 2: answer
+            with torch.inference_mode():
+                out2 = self.model.generate(
+                    **inputs2,
+                    max_new_tokens=answer_budget,
+                    do_sample=True,
+                    temperature=0.8,
+                    repetition_penalty=1.1,
+                    top_p=0.9,
+                )
+            answer_text = self.tokenizer.decode(out2[0, inputs2["input_ids"].shape[1] :], skip_special_tokens=True)
+        finally:
+            del inputs2
+            gc.collect()
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
 
         return reasoning_text, answer_text.strip()
 
@@ -155,7 +177,7 @@ class ComediaRAG:
             },
             "newspaper": {
                 "system_instruction": "És um cronista satírico a escrever um artigo de opinião para um jornal português.",
-                "task_instruction": "escreve um texto de opinião humorístico e satírico com entre 5 a 15 parágrafos sobre o seguinte tema",
+                "task_instruction": "escreve um texto de opinião humorístico e satírico com entre 5 a 12 parágrafos sobre o seguinte tema",
             },
             "tv_show": {
                 "system_instruction": "És o guionista de um programa de televisão humorístico estilo 'late-night' sobre a atualidade portuguesa.",
@@ -172,7 +194,7 @@ class ComediaRAG:
             # explicitly retrieve the documents
             docs_with_scores = self.vector_store.similarity_search_with_score(query, k=3)
 
-            SCORE_THRESHOLD = 2
+            SCORE_THRESHOLD = 0.50
             filtered = [(doc, score) for doc, score in docs_with_scores if score <= SCORE_THRESHOLD]
 
             # extract IDs and actual text
@@ -180,7 +202,7 @@ class ComediaRAG:
             retrieved_ids = []
             for doc, score in filtered:
                 logger.info(
-                    f'\tscore={score:.4f} // id={doc.metadata["sketch_id"]} // preview="{doc.metadata["clean_content"][:50]}"'
+                    f'\tscore={score:.4f} // id={doc.metadata["sketch_id"]} // preview="{doc.metadata["clean_content"][:30]}"'
                 )
 
                 s_id = doc.metadata.get("sketch_id", "UNKNOWN")
@@ -194,6 +216,9 @@ class ComediaRAG:
             # format the documents into a string context for the LLM Prompt
             formatted_context = ""
             for i, doc in enumerate(docs, 1):
+                if len(formatted_context) + len(doc.metadata["sketch_id"]) > 15000:
+                    logger.info(f"Maximum context size reached. Using only {i - 1} documents.")
+                    break
                 formatted_context += (
                     f"--- EXEMPLO {i} ({doc.metadata['sketch_id']}) ---\n{doc.metadata['clean_content']}\n"
                 )
@@ -216,9 +241,9 @@ class ComediaRAG:
                 ]
                 logger.warning(f"No sufficiently relevant sketches found for query: {query[:60]}...")
 
-            reasoning, clean_response = self._generate_bounded(messages, reasoning_budget=2500, answer_budget=3500)
+            reasoning, clean_response = self._generate_bounded(messages)
 
-            return {"text": clean_response, "sources": retrieved_contexts}
+            return {"text": clean_response, "sources": retrieved_contexts, "reasoning": reasoning}
 
         except Exception as e:
             logger.error(f"Generation chain failed for prompt: {query[:30]}... Reason: {e}")
