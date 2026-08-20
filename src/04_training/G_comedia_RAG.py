@@ -7,6 +7,7 @@ from langchain_huggingface import HuggingFaceEmbeddings
 import logging
 import os
 from pathlib import Path
+import re
 import torch
 import transformers
 
@@ -118,7 +119,7 @@ class ComediaRAG:
             logger.error(f"Failed to load Generative LLM: {e}")
             self.model = None
 
-    def _generate_bounded(self, messages, reasoning_budget=3000, answer_budget=1500):
+    def _generate_bounded(self, messages, reasoning_budget=4000, answer_budget=3000):
         """Two bounded phases: capped reasoning, then a guaranteed answer budget."""
         prompt = self.tokenizer.apply_chat_template(
             messages, tokenize=False, add_generation_prompt=True, enable_thinking=True
@@ -142,10 +143,11 @@ class ComediaRAG:
             torch.cuda.synchronize()
             torch.cuda.empty_cache()
 
-        if "</think>" not in reasoning_text:
-            logger.info("Reasoning hit its budget before closing naturally; forcing closure.")
-            reasoning_text = reasoning_text.split("<think>")[-1]
-            reasoning_text = "<think>" + reasoning_text + "\n</think>\n\n"
+        if "</think>" in reasoning_text:
+            reasoning_text = reasoning_text.split("</think>")[0] + "</think>\n\n"
+        else:
+            logger.info("Reasoning hit its token budget. forcing closure.")
+            reasoning_text = f"<think>{reasoning_text.split('<think>')[-1]}\n</think>\n\n"
 
         inputs2 = self.tokenizer(prompt + reasoning_text, return_tensors="pt").to(self.model.device)
         try:  # Phase 2: answer
@@ -165,7 +167,11 @@ class ComediaRAG:
             torch.cuda.synchronize()
             torch.cuda.empty_cache()
 
-        return reasoning_text, answer_text.strip()
+        clean_answer = re.sub(r"<think>[\s\S]*?</think>", "", answer_text)
+        clean_answer = re.sub(r"</?think>", "", clean_answer)
+        clean_answer = re.sub(r"^(?:assistant\s*)+", "", clean_answer.strip(), flags=re.IGNORECASE)
+
+        return reasoning_text, clean_answer.strip()
 
     def generate(self, query: str, format_type: str = "sketch") -> dict:
         """Executes the RAG chain, dynamically injecting instructions and returning full context."""
@@ -251,7 +257,7 @@ class ComediaRAG:
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="LangChain Luso-Laugh Batch RAG Generator")
+    parser = argparse.ArgumentParser(description="ComedIA RAG Batch Generator")
     parser.add_argument("--dry-run", action="store_true", help="Run without loading Qwen model")
     args = parser.parse_args()
 
