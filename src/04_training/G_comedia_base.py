@@ -59,7 +59,7 @@ class ComediaBaseline:
             self.model = None
 
     def _generate_bounded(
-        self, messages: list, reasoning_budget: int = 4000, answer_budget: int = 3000
+        self, messages: list, reasoning_budget: int = 3000, answer_budget: int = 3000
     ) -> Tuple[str, str]:
         """
         Executes a two-phase generation process: capped reasoning followed by a guaranteed answer.

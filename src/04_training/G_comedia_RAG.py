@@ -119,7 +119,7 @@ class ComediaRAG:
             logger.error(f"Failed to load Generative LLM: {e}")
             self.model = None
 
-    def _generate_bounded(self, messages, reasoning_budget=4000, answer_budget=3000):
+    def _generate_bounded(self, messages, reasoning_budget=3000, answer_budget=3000):
         """Two bounded phases: capped reasoning, then a guaranteed answer budget."""
         prompt = self.tokenizer.apply_chat_template(
             messages, tokenize=False, add_generation_prompt=True, enable_thinking=True
