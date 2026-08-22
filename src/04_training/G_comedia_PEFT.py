@@ -14,7 +14,6 @@ from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
     BitsAndBytesConfig,
-    TrainingArguments,
 )
 from trl import SFTConfig, SFTTrainer
 from typing import Dict, List, Tuple
@@ -51,15 +50,17 @@ class ComediaLoRATrainer:
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.adapter_name = f"comedia_lora_r{self.rank}"
 
-    def _format_chatml(self, example: Dict[str, List[str]]) -> List[str]:
+    def _format_chatml(self, example: Dict[str, List[str]]) -> dict:
         sys_msg = "És um argumentista profissional de comédia e sátira portuguesa."
         user_msg = f"{example['instruction']}\n\n{example['input']}"
         assistant_msg = example["output"]
-        return (
-            f"<|im_start|>system\n{sys_msg}<|im_end|>\n"
-            f"<|im_start|>user\n{user_msg}<|im_end|>\n"
-            f"<|im_start|>assistant\n{assistant_msg}<|im_end|>"
-        )
+        return {
+            "messages": [
+                {"role": "system", "content": sys_msg},
+                {"role": "user", "content": user_msg},
+                {"role": "assistant", "content": assistant_msg},
+            ]
+        }
 
     def train(self) -> None:
         if not self.dataset_path.exists():
@@ -68,6 +69,11 @@ class ComediaLoRATrainer:
 
         logger.info(f"Loading dataset from {self.dataset_path}")
         dataset = load_dataset("json", data_files=str(self.dataset_path), split="train")
+        dataset = dataset.map(
+            self._format_chatml,
+            batched=False,
+            remove_columns=dataset.column_names,
+        )
 
         logger.info(f"Initializing tokenizer for {self.model_name}")
         tokenizer = AutoTokenizer.from_pretrained(self.model_name, token=self.hf_token)
@@ -106,22 +112,6 @@ class ComediaLoRATrainer:
             task_type="CAUSAL_LM",
         )
 
-        training_args = TrainingArguments(
-            output_dir=str(self.output_dir / "checkpoints"),
-            per_device_train_batch_size=2,
-            gradient_accumulation_steps=4,
-            gradient_checkpointing=True,
-            learning_rate=2e-4,
-            lr_scheduler_type="cosine",
-            max_steps=500,
-            logging_steps=10,  # Keeps standard HF ETA logs updated frequently
-            save_steps=100,
-            optim="paged_adamw_32bit",
-            bf16=True,
-            warmup_ratio=0.03,
-            report_to="none",
-        )
-
         training_args = SFTConfig(
             output_dir=str(self.output_dir / "checkpoints"),
             per_device_train_batch_size=2,
@@ -132,11 +122,13 @@ class ComediaLoRATrainer:
             max_steps=500,
             logging_steps=10,
             save_steps=100,
-            optim="paged_adamw_32bit",
+            optim="adamw_torch",
             bf16=True,
             warmup_ratio=0.03,
             report_to="none",
             max_length=2048,
+            assistant_only_loss=True,
+            dataloader_num_workers=4,
         )
 
         trainer = SFTTrainer(
@@ -145,7 +137,6 @@ class ComediaLoRATrainer:
             peft_config=lora_config,
             processing_class=tokenizer,
             args=training_args,
-            formatting_func=self._format_chatml,
         )
 
         logger.info("Starting LoRA Fine-Tuning...")
@@ -235,7 +226,10 @@ class ComediaLoRAGenerator:
         else:
             reasoning_text = f"<think>{reasoning_text.split('<think>')[-1]}\n</think>\n\n"
 
-        inputs_answer = self.tokenizer(prompt + reasoning_text, return_tensors="pt").to(self.model.device)
+        transition_prompt = "Com base neste raciocínio, aqui está o texto longo e completo do formato pedido:\n\n"
+        inputs_answer = self.tokenizer(prompt + reasoning_text + transition_prompt, return_tensors="pt").to(
+            self.model.device
+        )
 
         try:
             with torch.inference_mode():
@@ -244,7 +238,7 @@ class ComediaLoRAGenerator:
                     max_new_tokens=answer_budget,
                     do_sample=True,
                     temperature=0.8,
-                    repetition_penalty=1.1,
+                    repetition_penalty=1.2,
                     top_p=0.9,
                 )
             answer_text = self.tokenizer.decode(
@@ -265,16 +259,45 @@ class ComediaLoRAGenerator:
     def generate(self, query: str, format_type: str = "sketch") -> Dict:
         format_mapping = {
             "sketch": {
-                "system_instruction": "És um argumentista profissional de comédia e sátira portuguesa.",
-                "task_instruction": "escreve um novo sketch de comédia para um vídeo entre 2 e 5 minutos sobre o seguinte tema",
+                "system_instruction": (
+                    "És um guionista profissional de comédia e sátira em Português de Portugal. "
+                    "O teu estilo é acutilante, irónico e subversivo, evitando o humor cliché ou 'seguro' da inteligência artificial. "
+                ),
+                "task_instruction": (
+                    "Escreve um sketch de comédia original para um vídeo (2 a 5 minutos) sobre o seguinte tema:\n'{query}'\n\n"
+                    "REGRAS OBRIGATÓRIAS:\n"
+                    "1. Usa ESTRITAMENTE Português de Portugal (PT-PT), incluindo vocabulário e expressões idiomáticas locais.\n"
+                    "2. Usa o formato de guião: [NOME DA PERSONAGEM] em maiúsculas antes das falas e didascálias (indicações cénicas) [entre parênteses retos].\n"
+                    "3. Usa o teu raciocínio para planear a ironia, a escalada do absurdo e as 'punchlines' antes de escreveres o guião final."
+                ),
             },
             "newspaper": {
-                "system_instruction": "És um cronista satírico a escrever um artigo de opinião para um jornal português.",
-                "task_instruction": "escreve um texto de opinião humorístico e satírico com entre 5 a 12 parágrafos sobre o seguinte tema",
+                "system_instruction": (
+                    "És um cronista satírico mordaz a escrever para um jornal português de renome. "
+                    "O teu tom é sarcástico e cheio de referências culturais locais."
+                ),
+                "task_instruction": (
+                    "Escreve um artigo de opinião humorístico e satírico (5 a 12 parágrafos) sobre o seguinte tema:\n'{query}'\n\n"
+                    "REGRAS OBRIGATÓRIAS:\n"
+                    "1. Usa ESTRITAMENTE Português de Portugal (PT-PT).\n"
+                    "2. Começa com um Título Satírico apelativo.\n"
+                    "3. Evita conclusões moralistas ou genéricas; mantém a ironia até à última frase.\n"
+                    "4. Usa o teu raciocínio para planear o ângulo crítico e os argumentos absurdos antes de escreveres o texto."
+                ),
             },
             "tv_show": {
-                "system_instruction": "És o guionista de um programa de televisão humorístico estilo 'late-night' sobre a atualidade portuguesa.",
-                "task_instruction": "escreve o guião de um monólogo televisivo de entre 2 a 5 minutos de duração que relata eventos reais de forma cómica sobre",
+                "system_instruction": (
+                    "És o apresentador e guionista principal de um programa de televisão humorístico estilo 'late-night' em Portugal. "
+                    "O teu humor foca-se na atualidade, no exagero e em expor o absurdo da vida quotidiana e política."
+                ),
+                "task_instruction": (
+                    "Escreve o guião de um monólogo televisivo (2 a 5 minutos) que relata eventos de forma cómica sobre o seguinte tema:\n'{query}'\n\n"
+                    "REGRAS OBRIGATÓRIAS:\n"
+                    "1. Usa ESTRITAMENTE Português de Portugal (PT-PT).\n"
+                    "2. Inclui marcadores de ritmo e interação com a plateia, como [Pausa para risos] ou [O público aplaude].\n"
+                    "3. Cria uma narrativa fluida que salte de uma observação absurda para a próxima.\n"
+                    "4. Usa o teu raciocínio para estruturar o ritmo antes de iniciares o monólogo."
+                ),
             },
         }
 
@@ -286,7 +309,7 @@ class ComediaLoRAGenerator:
         try:
             messages = [
                 {"role": "system", "content": f"{instructions['system_instruction']}\n..."},
-                {"role": "user", "content": f"{instructions['task_instruction']}: {query}"},
+                {"role": "user", "content": instructions["task_instruction"].format(query=query)},
             ]
             reasoning, clean_response = self._generate_bounded(messages)
             return {"text": clean_response, "sources": [], "reasoning": reasoning}

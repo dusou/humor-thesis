@@ -172,8 +172,8 @@ class TrainingDataFormatter:
             # TASK A: MICRO (Chain-of-Thought Punchlines)
             # ==========================================
             instruction = (
-                "Continue the following Portuguese comedy sketch. First, outline the comedic "
-                "logic and ironic subtext you will use. Then, generate the exact dialogue for the next punchline."
+                "Continua o seguinte sketch de comédia em português. Em primeiro lugar delibera sobre a lógica de comédia"
+                "e/ou ironia/sátira que irás utilizar. Depois, gera o exato diálogo para a próxima punchline."
             )
 
             for i, line in enumerate(data):
@@ -194,7 +194,7 @@ class TrainingDataFormatter:
                     current_speaker = line.get("speaker", "UNKNOWN")
                     punchline_text = line.get("text", "")
 
-                    output_str = f"[Raciocínio] {analysis} [Punchline] [{current_speaker}]: {punchline_text}"
+                    output_str = f"<think>\n{analysis}\n</think>\n\n[{current_speaker}]: {punchline_text}"
 
                     lora_entry = {
                         "instruction": instruction,
@@ -207,9 +207,7 @@ class TrainingDataFormatter:
             # ==========================================
             # TASK B: MACRO (Context Expansion)
             # ==========================================
-            instruction = (
-                "Write a complete Portuguese comedy sketch based on the following premise and stylistic direction."
-            )
+            instruction = "Escreve um novo sketch de comédia sobre o seguinte tema e premissa:"
 
             summary_input = self._generate_synthetic_summary(sketch_id, data)
             full_transcript = "\n".join(
