@@ -119,14 +119,14 @@ class ComediaLoRATrainer:
             gradient_checkpointing=True,
             learning_rate=2e-4,
             lr_scheduler_type="cosine",
-            max_steps=500,
+            num_train_epochs=3,
             logging_steps=10,
             save_steps=100,
             optim="adamw_torch",
             bf16=True,
             warmup_ratio=0.03,
             report_to="none",
-            max_length=2048,
+            max_length=4096,
             assistant_only_loss=True,
             dataloader_num_workers=4,
         )
@@ -195,7 +195,7 @@ class ComediaLoRAGenerator:
             self.model = None
 
     def _generate_bounded(
-        self, messages: list, reasoning_budget: int = 3000, answer_budget: int = 3000
+        self, messages: list, reasoning_budget: int = 2000, answer_budget: int = 2000
     ) -> Tuple[str, str]:
         prompt = self.tokenizer.apply_chat_template(
             messages, tokenize=False, add_generation_prompt=True, enable_thinking=True
@@ -211,6 +211,7 @@ class ComediaLoRAGenerator:
                     temperature=0.8,
                     repetition_penalty=1.1,
                     top_p=0.9,
+                    no_repeat_ngram_size=32,
                 )
             reasoning_text = self.tokenizer.decode(
                 out_reasoning[0, inputs["input_ids"].shape[1] :], skip_special_tokens=False
@@ -226,10 +227,7 @@ class ComediaLoRAGenerator:
         else:
             reasoning_text = f"<think>{reasoning_text.split('<think>')[-1]}\n</think>\n\n"
 
-        transition_prompt = "Com base neste raciocínio, aqui está o texto longo e completo do formato pedido:\n\n"
-        inputs_answer = self.tokenizer(prompt + reasoning_text + transition_prompt, return_tensors="pt").to(
-            self.model.device
-        )
+        inputs_answer = self.tokenizer(prompt + reasoning_text, return_tensors="pt").to(self.model.device)
 
         try:
             with torch.inference_mode():
@@ -237,9 +235,10 @@ class ComediaLoRAGenerator:
                     **inputs_answer,
                     max_new_tokens=answer_budget,
                     do_sample=True,
-                    temperature=0.8,
-                    repetition_penalty=1.2,
+                    temperature=0.7,
+                    repetition_penalty=1.1,
                     top_p=0.9,
+                    no_repeat_ngram_size=32,
                 )
             answer_text = self.tokenizer.decode(
                 out_answer[0, inputs_answer["input_ids"].shape[1] :], skip_special_tokens=True
@@ -256,6 +255,67 @@ class ComediaLoRAGenerator:
 
         return reasoning_text, clean_answer.strip()
 
+    def _cleanup_pass(self, format_type: str, raw_text: str) -> str:
+        cleanup_prompt = f"""
+                    Abaixo está um rascunho de um texto de comédia portuguesa (formato: {format_type})
+                    gerado automaticamente, que pode conter alguns tipos de problemas como:
+                    1. Repetição de falas ou frases no final do texto (ficou "preso" a repetir a mesma linha).
+                    2. Pequenos erros de formatação, como tags de personagem malformadas (ex: "[SPEAKER_00>" em vez de "[SPEAKER_00]").
+                    3. Personagens não existentes no sketch podem surgir subitamente entre parentesis retos.
+                    4. Palavras que podem aparecer em Português do Brasil em vez de Português Europeu.
+    
+                    --- RASCUNHO ---
+                    {raw_text}
+                    --- FIM DO RASCUNHO ---
+    
+                    Tarefa: devolve o texto corrigido, removendo quaisquer repetições do final e corrigindo
+                    erros de formatação. Se o texto tiver sido cortado a meio de uma repetição, termina-o de
+                    forma muito breve e natural (no máximo 2 a 3 falas adicionais).
+    
+                    IMPORTANTE:
+                    - Não alteres o conteúdo, o enredo ou o estilo do resto do texto a não ser que seja necessário para resolver os problemas acima.
+                    - Não acrescentes novas personagens ou temas.
+                    - Devolve apenas o texto corrigido, sem comentários, notas ou explicações.
+                    - Usa Português Europeu.
+                    """
+
+        messages = [
+            {
+                "role": "system",
+                "content": "És um editor de guiões de comédia portuguesa. A tua única tarefa é corrigir repetições e erros de formatação, mantendo tudo o resto inalterado.",
+            },
+            {"role": "user", "content": cleanup_prompt},
+        ]
+
+        prompt = self.tokenizer.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True, enable_thinking=False
+        )
+        inputs = self.tokenizer(prompt, return_tensors="pt").to(self.model.device)
+
+        input_len = inputs["input_ids"].shape[1]
+        cleanup_budget = min(input_len + 100, 4600)
+
+        try:
+            with self.model.disable_adapter():
+                with torch.inference_mode():
+                    out = self.model.generate(
+                        **inputs,
+                        max_new_tokens=cleanup_budget,
+                        do_sample=True,
+                        temperature=0.3,
+                        repetition_penalty=1.1,
+                        top_p=0.9,
+                        no_repeat_ngram_size=32,
+                    )
+                cleaned = self.tokenizer.decode(out[0, input_len:], skip_special_tokens=True)
+        finally:
+            del inputs, out
+            gc.collect()
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
+
+        return re.sub(r"^(?:assistant\s*)+", "", cleaned.strip(), flags=re.IGNORECASE)
+
     def generate(self, query: str, format_type: str = "sketch") -> Dict:
         format_mapping = {
             "sketch": {
@@ -264,7 +324,7 @@ class ComediaLoRAGenerator:
                     "O teu estilo é acutilante, irónico e subversivo, evitando o humor cliché ou 'seguro' da inteligência artificial. "
                 ),
                 "task_instruction": (
-                    "Escreve um sketch de comédia original para um vídeo (2 a 5 minutos) sobre o seguinte tema:\n'{query}'\n\n"
+                    "Escreve um sketch de comédia original para um vídeo (700 a 1000 palavras) sobre o seguinte tema:\n'{query}'\n\n"
                     "REGRAS OBRIGATÓRIAS:\n"
                     "1. Usa ESTRITAMENTE Português de Portugal (PT-PT), incluindo vocabulário e expressões idiomáticas locais.\n"
                     "2. Usa o formato de guião: [NOME DA PERSONAGEM] em maiúsculas antes das falas e didascálias (indicações cénicas) [entre parênteses retos].\n"
@@ -277,7 +337,7 @@ class ComediaLoRAGenerator:
                     "O teu tom é sarcástico e cheio de referências culturais locais."
                 ),
                 "task_instruction": (
-                    "Escreve um artigo de opinião humorístico e satírico (5 a 12 parágrafos) sobre o seguinte tema:\n'{query}'\n\n"
+                    "Escreve um artigo de opinião humorístico e satírico (700 a 1000 palavras) sobre o seguinte tema:\n'{query}'\n\n"
                     "REGRAS OBRIGATÓRIAS:\n"
                     "1. Usa ESTRITAMENTE Português de Portugal (PT-PT).\n"
                     "2. Começa com um Título Satírico apelativo.\n"
@@ -291,7 +351,7 @@ class ComediaLoRAGenerator:
                     "O teu humor foca-se na atualidade, no exagero e em expor o absurdo da vida quotidiana e política."
                 ),
                 "task_instruction": (
-                    "Escreve o guião de um monólogo televisivo (2 a 5 minutos) que relata eventos de forma cómica sobre o seguinte tema:\n'{query}'\n\n"
+                    "Escreve o guião de um monólogo televisivo (700 a 1000 palavras) que relata eventos de forma cómica sobre o seguinte tema:\n'{query}'\n\n"
                     "REGRAS OBRIGATÓRIAS:\n"
                     "1. Usa ESTRITAMENTE Português de Portugal (PT-PT).\n"
                     "2. Inclui marcadores de ritmo e interação com a plateia, como [Pausa para risos] ou [O público aplaude].\n"
@@ -311,8 +371,11 @@ class ComediaLoRAGenerator:
                 {"role": "system", "content": f"{instructions['system_instruction']}\n..."},
                 {"role": "user", "content": instructions["task_instruction"].format(query=query)},
             ]
-            reasoning, clean_response = self._generate_bounded(messages)
-            return {"text": clean_response, "sources": [], "reasoning": reasoning}
+            reasoning, response = self._generate_bounded(messages)
+            clean_response = response
+            clean_response = self._cleanup_pass(format_type, response)
+            print("===/ AFTER CLEANUP /====" + clean_response)
+            return {"text": clean_response, "sources": [], "reasoning": reasoning, "response_without_cleanup": response}
         except Exception as e:
             logger.error(f"Generation failed: {e}")
             return {"text": "ERROR: Generation failed.", "sources": []}
@@ -328,7 +391,11 @@ if __name__ == "__main__":
         help="Select 'train' to fine-tune or 'generate' to batch process prompts.",
     )
     parser.add_argument(
-        "--rank", type=int, default=16, choices=[8, 16, 64], help="LoRA rank dimension. Alpha will be set to rank * 2."
+        "--rank",
+        type=int,
+        default=16,
+        choices=[8, 16, 32, 64],
+        help="LoRA rank dimension. Alpha will be set to rank * 2.",
     )
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()

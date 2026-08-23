@@ -79,6 +79,7 @@ class ComediaBaseline:
                     temperature=0.8,
                     repetition_penalty=1.1,
                     top_p=0.9,
+                    no_repeat_ngram_size=32,
                 )
             reasoning_text = self.tokenizer.decode(
                 out_reasoning[0, inputs["input_ids"].shape[1] :], skip_special_tokens=False
@@ -103,9 +104,10 @@ class ComediaBaseline:
                     **inputs_answer,
                     max_new_tokens=answer_budget,
                     do_sample=True,
-                    temperature=0.8,
+                    temperature=0.7,
                     repetition_penalty=1.1,
                     top_p=0.9,
+                    no_repeat_ngram_size=32,
                 )
             answer_text = self.tokenizer.decode(
                 out_answer[0, inputs_answer["input_ids"].shape[1] :], skip_special_tokens=True
@@ -121,6 +123,67 @@ class ComediaBaseline:
         clean_answer = re.sub(r"^(?:assistant\s*)+", "", clean_answer.strip(), flags=re.IGNORECASE)
 
         return reasoning_text, clean_answer.strip()
+
+    def _cleanup_pass(self, format_type: str, raw_text: str) -> str:
+        cleanup_prompt = f"""
+                        Abaixo está um rascunho de um texto de comédia portuguesa (formato: {format_type})
+                        gerado automaticamente, que pode conter alguns tipos de problemas como:
+                        1. Repetição de falas ou frases no final do texto (ficou "preso" a repetir a mesma linha).
+                        2. Pequenos erros de formatação, como tags de personagem malformadas (ex: "[SPEAKER_00>" em vez de "[SPEAKER_00]").
+                        3. Personagens não existentes no sketch podem surgir subitamente entre parentesis retos.
+                        4. Palavras que podem aparecer em Português do Brasil em vez de Português Europeu.
+        
+                        --- RASCUNHO ---
+                        {raw_text}
+                        --- FIM DO RASCUNHO ---
+        
+                        Tarefa: devolve o texto corrigido, removendo quaisquer repetições do final e corrigindo
+                        erros de formatação. Se o texto tiver sido cortado a meio de uma repetição, termina-o de
+                        forma muito breve e natural (no máximo 2 a 3 falas adicionais).
+        
+                        IMPORTANTE:
+                        - Não alteres o conteúdo, o enredo ou o estilo do resto do texto a não ser que seja necessário para resolver os problemas acima.
+                        - Não acrescentes novas personagens ou temas.
+                        - Devolve apenas o texto corrigido, sem comentários, notas ou explicações.
+                        - Usa Português Europeu.
+                        """
+
+        messages = [
+            {
+                "role": "system",
+                "content": "És um editor de guiões de comédia portuguesa. A tua única tarefa é corrigir repetições e erros de formatação, mantendo tudo o resto inalterado.",
+            },
+            {"role": "user", "content": cleanup_prompt},
+        ]
+
+        prompt = self.tokenizer.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True, enable_thinking=False
+        )
+        inputs = self.tokenizer(prompt, return_tensors="pt").to(self.model.device)
+
+        input_len = inputs["input_ids"].shape[1]
+        cleanup_budget = min(input_len + 100, 4600)
+
+        try:
+            with self.model.disable_adapter():
+                with torch.inference_mode():
+                    out = self.model.generate(
+                        **inputs,
+                        max_new_tokens=cleanup_budget,
+                        do_sample=True,
+                        temperature=0.3,
+                        repetition_penalty=1.1,
+                        top_p=0.9,
+                        no_repeat_ngram_size=32,
+                    )
+                cleaned = self.tokenizer.decode(out[0, input_len:], skip_special_tokens=True)
+        finally:
+            del inputs, out
+            gc.collect()
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
+
+        return re.sub(r"^(?:assistant\s*)+", "", cleaned.strip(), flags=re.IGNORECASE)
 
     def generate(self, query: str, format_type: str = "sketch") -> Dict:
         """
@@ -151,8 +214,11 @@ class ComediaBaseline:
                 {"role": "system", "content": f"{instructions['system_instruction']}\n..."},
                 {"role": "user", "content": f"{instructions['task_instruction']}: {query}"},
             ]
-            reasoning, clean_response = self._generate_bounded(messages)
-            return {"text": clean_response, "sources": [], "reasoning": reasoning}
+            reasoning, response = self._generate_bounded(messages)
+            clean_response = response
+            clean_response = self._cleanup_pass(format_type, response)
+            print("===/ AFTER CLEANUP /====" + clean_response)
+            return {"text": clean_response, "sources": [], "reasoning": reasoning, "response_without_cleanup": response}
 
         except Exception as e:
             logger.error(f"Baseline generation failed for prompt: {query[:30]}... Reason: {e}")
