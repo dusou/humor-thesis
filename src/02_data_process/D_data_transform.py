@@ -1,3 +1,4 @@
+import argparse
 import json
 import logging
 import os
@@ -13,10 +14,9 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Reduce transformer warnings
 transformers.logging.set_verbosity_error()
-
 os.environ["HF_HUB_DISABLE_TELEMETRY"] = "1"
+
 hf_cache = Path(os.path.expanduser("~/.cache/huggingface/hub"))
 qwen_folder = hf_cache / "models--Qwen--Qwen3.5-9B"
 
@@ -30,8 +30,8 @@ else:
 
 class TrainingDataFormatter:
     """
-    Transforms the Luso-Laugh annotated JSON files into RAG-ready documents
-    and a multi-task LoRA JSONL dataset (Micro/Macro comedy generation).
+    Transforms Luso-Laugh annotated JSON files into RAG-ready documents
+    and a LoRA JSONL dataset specialized in full-sketch generation.
     """
 
     def __init__(
@@ -40,20 +40,20 @@ class TrainingDataFormatter:
         rag_output_dir="../../data/04_rag_ready",
         lora_output_dir="../../data/04_lora_ready",
         dry_run=False,
+        variants_per_sketch=1,
     ):
         self.input_dir = Path(input_dir)
         self.rag_output_dir = Path(rag_output_dir)
         self.lora_output_dir = Path(lora_output_dir)
         self.dry_run = dry_run
+        self.variants = variants_per_sketch
 
         # Ensure output directories exist
         self.rag_output_dir.mkdir(parents=True, exist_ok=True)
         self.lora_output_dir.mkdir(parents=True, exist_ok=True)
-
         self.lora_output_file = self.lora_output_dir / "lora_instruction_dataset.jsonl"
 
         self.hf_token = os.getenv("HF_TOKEN")
-
         self._init_llm()
 
     def _init_llm(self):
@@ -104,32 +104,22 @@ class TrainingDataFormatter:
             json.dump(rag_document, f, ensure_ascii=False, indent=4)
 
     def _generate_synthetic_summary(self, sketch_id: str, data: list) -> str:
-        """
-        Uses the local model to generate a short, structural premise
-        for the given sketch transcript to be used in the Macro LoRA task.
-        """
-        speakers = list(set([line.get("speaker", "UNKNOWN") for line in data]))
+        speakers = list({line.get("speaker", "UNKNOWN") for line in data})
         fallback_summary = f"Um sketch de comédia portuguesa envolvendo uma interação entre {', '.join(speakers)}."
 
         if self.dry_run or not self.llm_pipeline:
             return fallback_summary
 
-        transcript_lines = [f"[{line.get('speaker', 'UNKNOWN')}]: {line.get('text', '')}" for line in data]
-        full_transcript = "\n".join(transcript_lines)
+        full_transcript = "\n".join([f"[{line.get('speaker', 'UNKNOWN')}]: {line.get('text', '')}" for line in data])
 
-        prompt = f"""
-                Lê a seguinte transcrição de um texto de comédia portuguesa. Este texto poderá ser um sketch, um programa de televisão, um podcast ou outro meio de difusão de comédia.
-
-                --- TRANSCRIÇÃO ---
-                {full_transcript}
-                --------------------
-
-                Escreve um breve resumo (5 frases no máximo) que descreva a premissa principal, o cenário e a dinâmica deste texto. 
-                Responde estritamente em Português de Portugal.
-
-                FORMATO OBRIGATÓRIO:
-                RESUMO: [O teu resumo aqui]
-                """
+        prompt = (
+            "Lê a seguinte transcrição de um texto de comédia portuguesa.\n"
+            f"--- TRANSCRIÇÃO ---\n{full_transcript}\n--------------------\n\n"
+            "Escreve um breve resumo (5 frases no máximo) que descreva a premissa principal, "
+            "o cenário e a dinâmica deste texto.\n"
+            "Responde estritamente em Português de Portugal.\n\n"
+            "FORMATO OBRIGATÓRIO:\nRESUMO: [O teu resumo aqui]"
+        )
 
         messages = [
             {
@@ -148,155 +138,190 @@ class TrainingDataFormatter:
                 do_sample=True,
                 continue_final_message=True,
             )
-
             raw_text = outputs[0]["generated_text"][-1]["content"].strip()
-
             final_summary = raw_text.replace("RESUMO:", "").replace("**", "").strip()
 
             logger.info(f"Generated summary for {sketch_id}: {final_summary[:60]}...")
             return final_summary
-
         except Exception as e:
             logger.warning(f"LLM summarization failed: {e}. Reverting to fallback summary.")
             return fallback_summary
 
-    def format_for_lora(self, sketch_id: str, data: list, lora_file):
-        """
-        Routes the sketch to either the Micro task (punchline completion)
-        or the Macro task (full sketch generation from premise) based on laughter presence.
-        """
-        has_punchlines = any(line.get("is_punchline", False) for line in data)
+    def _generate_synthetic_arc_reasoning(self, sketch_id: str, premise: str, punchline_beats: list) -> str:
+        fallback_reasoning = (
+            f"Vou escrever um sketch original com a seguinte premissa: {premise} "
+            "Vou estruturar o texto com uma escalada gradual de absurdo, encadeando várias piadas até à punchline final."
+        )
 
-        if has_punchlines:
-            # ==========================================
-            # TASK A: MICRO (Chain-of-Thought Punchlines)
-            # ==========================================
-            instruction = (
-                "Continua o seguinte sketch de comédia em português. Em primeiro lugar delibera sobre a lógica de comédia"
-                "e/ou ironia/sátira que irás utilizar. Depois, gera o exato diálogo para a próxima punchline."
+        if self.dry_run or not self.llm_pipeline:
+            return fallback_reasoning
+
+        reference_note = ""
+        if punchline_beats:
+            max_beats = 10
+            if len(punchline_beats) > max_beats:
+                step = len(punchline_beats) / max_beats
+                sampled = [punchline_beats[int(i * step)] for i in range(max_beats)]
+            else:
+                sampled = punchline_beats
+
+            beats_block = "\n".join(
+                f"{i + 1}. (sobre '{text[:60]}...') {analysis}" for i, (speaker, text, analysis) in enumerate(sampled)
+            )
+            reference_note = (
+                "Este sketch original continha esta sequência de piadas (analisadas a posteriori, "
+                f"por ordem de aparição, apenas como inspiração):\n{beats_block}\n\n"
             )
 
-            for i, line in enumerate(data):
-                if line.get("is_punchline", False):
-                    analysis = line.get("semantic_metadata", {}).get("humor_analysis")
+        prompt = (
+            f'Vais escrever um sketch de comédia portuguesa completo com a seguinte premissa:\n"{premise}"\n\n'
+            f"{reference_note}"
+            "Antes de escreveres o sketch, planeia em voz alta, na primeira pessoa e no FUTURO, o arco cómico COMPLETO do texto: "
+            "como vais abrir a cena, que técnica de ironia/sátira vais usar em cada piada sucessiva, como escalam, e como termina a punchline final.\n"
+            "NÃO expliques piadas isoladas -- sintetiza tudo num ÚNICO plano coeso de progressão.\n"
+            "Sê estruturado mas conciso (máximo 8 frases).\n\n"
+            "FORMATO OBRIGATÓRIO:\nPLANO: [o teu plano aqui]"
+        )
 
-                    if not analysis or "Local LLM Error" in analysis:
-                        continue
+        messages = [
+            {
+                "role": "system",
+                "content": "És um argumentista profissional de comédia portuguesa a planear a estrutura completa de um novo sketch.",
+            },
+            {"role": "user", "content": prompt},
+            {"role": "assistant", "content": "PLANO:"},
+        ]
 
-                    # Cumulative context from the very beginning up to the punchline
-                    context_lines = data[:i]
-                    if not context_lines:
-                        continue
+        try:
+            outputs = self.llm_pipeline(
+                messages,
+                temperature=0.7,
+                max_new_tokens=2048,
+                do_sample=True,
+                continue_final_message=True,
+            )
+            raw_text = outputs[0]["generated_text"][-1]["content"].strip()
+            final_reasoning = raw_text.replace("PLANO:", "").replace("**", "").strip()
 
-                    context_str = "\n".join(
-                        [f"[{c.get('speaker', 'UNKNOWN')}]: {c.get('text', '')}" for c in context_lines]
-                    )
-                    current_speaker = line.get("speaker", "UNKNOWN")
-                    punchline_text = line.get("text", "")
+            logger.info(f"Generated arc reasoning for {sketch_id}: {final_reasoning[:60]}...")
+            return final_reasoning
+        except Exception as e:
+            logger.warning(f"LLM arc reasoning synthesis failed: {e}. Reverting to fallback.")
+            return fallback_reasoning
 
-                    output_str = f"<think>\n{analysis}\n</think>\n\n[{current_speaker}]: {punchline_text}"
+    def format_for_lora(self, sketch_id: str, data: list, lora_file) -> int:
+        punchline_beats = []
+        for line in data:
+            if line.get("is_punchline", False):
+                analysis = line.get("semantic_metadata", {}).get("humor_analysis")
+                if analysis and "Local LLM Error" not in analysis:
+                    punchline_beats.append((line.get("speaker", "UNKNOWN"), line.get("text", ""), analysis))
 
-                    lora_entry = {
-                        "instruction": instruction,
-                        "input": context_str,
-                        "output": output_str,
-                    }
-                    lora_file.write(json.dumps(lora_entry, ensure_ascii=False) + "\n")
+        macro_instruction = "Escreve um novo sketch de comédia sobre o seguinte tema e premissa:"
+        full_transcript = "\n".join([f"[{line.get('speaker', 'UNKNOWN')}]: {line.get('text', '')}" for line in data])
 
-        else:
-            # ==========================================
-            # TASK B: MACRO (Context Expansion)
-            # ==========================================
-            instruction = "Escreve um novo sketch de comédia sobre o seguinte tema e premissa:"
+        variants = 1 if self.dry_run else self.variants
+        macro_count = 0
 
+        for _ in range(variants):
             summary_input = self._generate_synthetic_summary(sketch_id, data)
-            full_transcript = "\n".join(
-                [f"[{line.get('speaker', 'UNKNOWN')}]: {line.get('text', '')}" for line in data]
-            )
+            reasoning = self._generate_synthetic_arc_reasoning(sketch_id, summary_input, punchline_beats)
+            macro_output = f"<think>\n{reasoning}\n</think>\n\n{full_transcript}"
 
             lora_entry = {
-                "instruction": instruction,
+                "task": "macro",
+                "sketch_id": sketch_id,
+                "instruction": macro_instruction,
                 "input": summary_input,
-                "output": full_transcript,
+                "output": macro_output,
             }
             lora_file.write(json.dumps(lora_entry, ensure_ascii=False) + "\n")
+            macro_count += 1
 
-    def process_sketch(self, filepath: Path):
-        """Processes a single sketch and saves its RAG and LoRA representations."""
-        sketch_id = filepath.name.replace("_annotated.json", "")
+        return macro_count
 
-        with open(filepath, "r", encoding="utf-8") as f:
-            try:
+    def process_sketch(self, filepath: Path) -> tuple[bool, int]:
+        sketch_id = filepath.stem.replace("_annotated", "")
+
+        try:
+            with open(filepath, "r", encoding="utf-8") as f:
                 data = json.load(f)
-            except json.JSONDecodeError:
-                logger.error(f"Failed to parse {filepath.name}. Skipping.")
-                return False
+        except json.JSONDecodeError:
+            logger.error(f"Failed to parse {filepath.name}. Skipping.")
+            return False, 0
 
-        # RAG adaptation
         self.format_for_rag(sketch_id, data)
 
-        # LORA JSONL adaptation
         with open(self.lora_output_file, "a", encoding="utf-8") as lora_f:
-            self.format_for_lora(sketch_id, data, lora_f)
+            macro_count = self.format_for_lora(sketch_id, data, lora_f)
 
-        return True
+        return True, macro_count
 
 
 if __name__ == "__main__":
-    import argparse
-
     parser = argparse.ArgumentParser(description="Format LusoLaugh Data")
     parser.add_argument("--dry-run", action="store_true", help="Run without loading the LLM")
+    parser.add_argument(
+        "--macro-variants",
+        type=int,
+        default=1,
+        help="Number of diverse full-sketch training examples to generate per sketch.",
+    )
     args = parser.parse_args()
 
-    dirname = os.path.dirname(__file__)
-    input_dir = Path(os.path.normpath(os.path.join(dirname, "../../data/03_final_dataset/")))
-    rag_output_dir = Path(os.path.normpath(os.path.join(dirname, "../../data/04_rag_ready/")))
-    lora_output_dir = Path(os.path.normpath(os.path.join(dirname, "../../data/04_lora_ready/")))
+    base_dir = Path(__file__).resolve().parent.parent.parent / "data"
+    input_dir = base_dir / "03_final_dataset"
+    rag_output_dir = base_dir / "04_rag_ready"
+    lora_output_dir = base_dir / "04_lora_ready"
 
     input_dir.mkdir(parents=True, exist_ok=True)
     rag_output_dir.mkdir(parents=True, exist_ok=True)
     lora_output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Find all source files
     input_files = list(input_dir.glob("*_annotated.json"))
-
-    # Check which ones have already been generated in the RAG folder
-    processed_files = list(rag_output_dir.glob("*_rag.json"))
-    processed_ids = set(f.name.replace("_rag.json", "") for f in processed_files)
-
-    # Filter down to only what is missing
-    pending_files = [f for f in input_files if f.name.replace("_annotated.json", "") not in processed_ids]
-
-    total_count = len(input_files)
-    processed_count = len(processed_ids)
-    ready_count = len(pending_files)
+    processed_ids = {f.stem.replace("_rag", "") for f in rag_output_dir.glob("*_rag.json")}
+    pending_files = [f for f in input_files if f.stem.replace("_annotated", "") not in processed_ids]
 
     logger.info("=" * 45)
     logger.info("LUSO-LAUGH TRANSFORM PIPELINE STATUS")
     logger.info("=" * 45)
-    logger.info(f"Total annotated sketches:\t{total_count}")
-    logger.info(f"Already transformed:\t\t{processed_count}")
-    logger.info(f"To process this run:\t\t{ready_count}")
+    logger.info(f"Total annotated sketches:    {len(input_files)}")
+    logger.info(f"Already transformed:         {len(processed_ids)}")
+    logger.info(f"To process this run:         {len(pending_files)}")
+    logger.info(f"Variants per sketch:         {args.macro_variants}")
     logger.info("=" * 45)
 
-    if ready_count == 0:
-        logger.info("No sketches are currently pending transformation. Exiting.")
+    if not pending_files:
+        logger.info("No sketches pending transformation. Exiting.")
         exit()
 
     formatter = TrainingDataFormatter(
         dry_run=args.dry_run,
-        input_dir=str(input_dir),
-        rag_output_dir=str(rag_output_dir),
-        lora_output_dir=str(lora_output_dir),
+        input_dir=input_dir,
+        rag_output_dir=rag_output_dir,
+        lora_output_dir=lora_output_dir,
+        variants_per_sketch=args.macro_variants,
     )
 
-    for current_count, filepath in enumerate(pending_files, start=1):
-        sketch_id = filepath.name.replace("_annotated.json", "")
+    total_examples = 0
+    sketches_processed = 0
 
-        logger.info(f"\033[96m--- Transforming Sketch ID: {sketch_id} ({current_count}/{ready_count}) ---\033[0m")
-        formatter.process_sketch(filepath)
+    for current_count, filepath in enumerate(pending_files, start=1):
+        sketch_id = filepath.stem.replace("_annotated", "")
+        logger.info(
+            f"\033[96m--- Transforming Sketch ID: {sketch_id} ({current_count}/{len(pending_files)}) ---\033[0m"
+        )
+
+        success, example_count = formatter.process_sketch(filepath)
+        if success:
+            total_examples += example_count
+            sketches_processed += 1
 
     logger.info("Transformation complete.")
     logger.info(f"RAG files saved to: {rag_output_dir}")
     logger.info(f"LoRA JSONL saved to: {formatter.lora_output_file}")
+    logger.info(f"Sketches processed this run:  {sketches_processed}")
+    logger.info(f"Total LoRA examples generated:{total_examples}")
+
+    if sketches_processed > 0:
+        logger.info(f"Average examples per sketch:  {total_examples / sketches_processed:.1f}")
