@@ -10,6 +10,10 @@ from pathlib import Path
 import re
 import torch
 import transformers
+from transformers import (
+    StoppingCriteria,
+    StoppingCriteriaList,
+)
 
 # Setup logging
 logging.basicConfig(
@@ -23,6 +27,17 @@ logger = logging.getLogger(__name__)
 transformers.logging.set_verbosity_error()
 os.environ["HF_HUB_DISABLE_TELEMETRY"] = "1"
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+
+
+class ThinkCloseStoppingCriteria(StoppingCriteria):
+    def __init__(self, tokenizer, prompt_len):
+        self.tokenizer = tokenizer
+        self.prompt_len = prompt_len
+
+    def __call__(self, input_ids, scores, **kwargs):
+        tail_ids = input_ids[0, self.prompt_len :]
+        tail_text = self.tokenizer.decode(tail_ids[-8:], skip_special_tokens=False)
+        return "</think>" in tail_text
 
 
 class ComediaRAG:
@@ -132,10 +147,12 @@ class ComediaRAG:
                     **inputs,
                     max_new_tokens=reasoning_budget,
                     do_sample=True,
-                    temperature=0.8,
-                    repetition_penalty=1.1,
+                    temperature=0.7,
+                    repetition_penalty=1.05,
                     top_p=0.9,
-                    no_repeat_ngram_size=32,
+                    stopping_criteria=StoppingCriteriaList(
+                        [ThinkCloseStoppingCriteria(self.tokenizer, inputs["input_ids"].shape[1])]
+                    ),
                 )
             reasoning_text = self.tokenizer.decode(out1[0, inputs["input_ids"].shape[1] :], skip_special_tokens=False)
         finally:  # Memory Cleanup
@@ -157,10 +174,9 @@ class ComediaRAG:
                     **inputs2,
                     max_new_tokens=answer_budget,
                     do_sample=True,
-                    temperature=0.7,
-                    repetition_penalty=1.1,
+                    temperature=0.6,
+                    repetition_penalty=1.05,
                     top_p=0.9,
-                    no_repeat_ngram_size=32,
                 )
             answer_text = self.tokenizer.decode(out2[0, inputs2["input_ids"].shape[1] :], skip_special_tokens=True)
         finally:
@@ -224,7 +240,6 @@ class ComediaRAG:
                     temperature=0.3,
                     repetition_penalty=1.1,
                     top_p=0.9,
-                    no_repeat_ngram_size=32,
                 )
             cleaned = self.tokenizer.decode(out[0, input_len:], skip_special_tokens=True)
         finally:
@@ -241,15 +256,15 @@ class ComediaRAG:
         FORMAT_MAPPING = {
             "sketch": {
                 "system_instruction": "És um argumentista profissional de comédia e sátira portuguesa.",
-                "task_instruction": "escreve um novo sketch de comédia para um vídeo entre 600 a 1000 palavras sobre o seguinte tema",
+                "task_instruction": "escreve um novo sketch de comédia para um vídeo entre 500 a 800 palavras sobre o seguinte tema",
             },
             "newspaper": {
                 "system_instruction": "És um cronista satírico a escrever um artigo de opinião para um jornal português.",
-                "task_instruction": "escreve um texto de opinião humorístico e satírico com entre 600 a 1000 palavras sobre o seguinte tema",
+                "task_instruction": "escreve um texto de opinião humorístico e satírico com entre 500 a 8000 palavras sobre o seguinte tema",
             },
             "tv_show": {
                 "system_instruction": "És o guionista de um programa de televisão humorístico estilo 'late-night' sobre a atualidade portuguesa.",
-                "task_instruction": "escreve o guião de um monólogo televisivo de entre 600 a 1000 palavras de duração que relata eventos reais de forma cómica sobre",
+                "task_instruction": "escreve o guião de um monólogo televisivo de entre 500 a 800 palavras de duração que relata eventos reais de forma cómica sobre",
             },
         }
 

@@ -14,6 +14,9 @@ from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
     BitsAndBytesConfig,
+    EarlyStoppingCallback,
+    StoppingCriteria,
+    StoppingCriteriaList,
 )
 from trl import SFTConfig, SFTTrainer
 from typing import Dict, List, Tuple
@@ -28,6 +31,17 @@ logger = logging.getLogger(__name__)
 transformers.logging.set_verbosity_error()
 os.environ["HF_HUB_DISABLE_TELEMETRY"] = "1"
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+
+
+class ThinkCloseStoppingCriteria(StoppingCriteria):
+    def __init__(self, tokenizer, prompt_len):
+        self.tokenizer = tokenizer
+        self.prompt_len = prompt_len
+
+    def __call__(self, input_ids, scores, **kwargs):
+        tail_ids = input_ids[0, self.prompt_len :]
+        tail_text = self.tokenizer.decode(tail_ids[-8:], skip_special_tokens=False)
+        return "</think>" in tail_text
 
 
 class ComediaLoRATrainer:
@@ -69,11 +83,16 @@ class ComediaLoRATrainer:
 
         logger.info(f"Loading dataset from {self.dataset_path}")
         dataset = load_dataset("json", data_files=str(self.dataset_path), split="train")
-        dataset = dataset.map(
+        full_dataset = dataset.map(
             self._format_chatml,
             batched=False,
             remove_columns=dataset.column_names,
         )
+
+        split_dataset = full_dataset.train_test_split(test_size=0.05, seed=42)
+        train_data = split_dataset["train"]
+        eval_data = split_dataset["test"]
+        logger.info(f"Training on {len(train_data)} examples, evaluating on {len(eval_data)} examples.")
 
         logger.info(f"Initializing tokenizer for {self.model_name}")
         tokenizer = AutoTokenizer.from_pretrained(self.model_name, token=self.hf_token)
@@ -100,7 +119,7 @@ class ComediaLoRATrainer:
         model.config.use_cache = False
 
         # Dynamic alpha scaling based on rank
-        lora_alpha = self.rank * 2
+        lora_alpha = self.rank
         logger.info(f"Applying LoRA config (rank={self.rank}, alpha={lora_alpha})")
 
         lora_config = LoraConfig(
@@ -119,9 +138,13 @@ class ComediaLoRATrainer:
             gradient_checkpointing=True,
             learning_rate=2e-4,
             lr_scheduler_type="cosine",
-            num_train_epochs=3,
+            num_train_epochs=7,
             logging_steps=10,
-            save_steps=100,
+            eval_strategy="steps",
+            eval_steps=20,
+            save_steps=20,
+            load_best_model_at_end=True,
+            metric_for_best_model="eval_loss",
             optim="adamw_torch",
             bf16=True,
             warmup_ratio=0.03,
@@ -133,19 +156,31 @@ class ComediaLoRATrainer:
 
         trainer = SFTTrainer(
             model=model,
-            train_dataset=dataset,
+            train_dataset=train_data,
+            eval_dataset=eval_data,
             peft_config=lora_config,
             processing_class=tokenizer,
             args=training_args,
+            callbacks=[EarlyStoppingCallback(early_stopping_patience=3)],
         )
 
         logger.info("Starting LoRA Fine-Tuning...")
-        trainer.train()
+        train_result = trainer.train()
+
+        train_metrics = train_result.metrics
+        trainer.log_metrics("train", train_metrics)
+        trainer.save_metrics("train", train_metrics)
+
+        logger.info("Running final evaluation on the best model checkpoint...")
+        eval_metrics = trainer.evaluate()
+        trainer.log_metrics("eval", eval_metrics)
+        trainer.save_metrics("eval", eval_metrics)
 
         final_save_path = self.output_dir / self.adapter_name
         trainer.model.save_pretrained(str(final_save_path))
         tokenizer.save_pretrained(str(final_save_path))
-        logger.info(f"Training complete. Adapter saved to {final_save_path}")
+        trainer.save_state()
+        logger.info(f"Training complete. Adapter and metrics saved to {final_save_path}")
 
 
 class ComediaLoRAGenerator:
@@ -208,10 +243,12 @@ class ComediaLoRAGenerator:
                     **inputs,
                     max_new_tokens=reasoning_budget,
                     do_sample=True,
-                    temperature=0.8,
-                    repetition_penalty=1.1,
+                    temperature=0.7,
+                    repetition_penalty=1.05,
                     top_p=0.9,
-                    no_repeat_ngram_size=32,
+                    stopping_criteria=StoppingCriteriaList(
+                        [ThinkCloseStoppingCriteria(self.tokenizer, inputs["input_ids"].shape[1])]
+                    ),
                 )
             reasoning_text = self.tokenizer.decode(
                 out_reasoning[0, inputs["input_ids"].shape[1] :], skip_special_tokens=False
@@ -235,10 +272,9 @@ class ComediaLoRAGenerator:
                     **inputs_answer,
                     max_new_tokens=answer_budget,
                     do_sample=True,
-                    temperature=0.7,
-                    repetition_penalty=1.1,
+                    temperature=0.6,
+                    repetition_penalty=1.05,
                     top_p=0.9,
-                    no_repeat_ngram_size=32,
                 )
             answer_text = self.tokenizer.decode(
                 out_answer[0, inputs_answer["input_ids"].shape[1] :], skip_special_tokens=True
@@ -253,7 +289,9 @@ class ComediaLoRAGenerator:
         clean_answer = re.sub(r"</?think>", "", clean_answer)
         clean_answer = re.sub(r"^(?:assistant\s*)+", "", clean_answer.strip(), flags=re.IGNORECASE)
 
-        return reasoning_text, clean_answer.strip()
+        clean_reasoning = re.sub(r"</?think>", "", reasoning_text).strip()
+
+        return clean_reasoning, clean_answer.strip()
 
     def _cleanup_pass(self, format_type: str, raw_text: str) -> str:
         cleanup_prompt = f"""
@@ -293,7 +331,7 @@ class ComediaLoRAGenerator:
         inputs = self.tokenizer(prompt, return_tensors="pt").to(self.model.device)
 
         input_len = inputs["input_ids"].shape[1]
-        cleanup_budget = min(input_len + 100, 4600)
+        cleanup_budget = min(input_len + 50, 3500)
 
         try:
             with self.model.disable_adapter():
@@ -303,9 +341,8 @@ class ComediaLoRAGenerator:
                         max_new_tokens=cleanup_budget,
                         do_sample=True,
                         temperature=0.3,
-                        repetition_penalty=1.1,
+                        repetition_penalty=1.05,
                         top_p=0.9,
-                        no_repeat_ngram_size=32,
                     )
                 cleaned = self.tokenizer.decode(out[0, input_len:], skip_special_tokens=True)
         finally:
@@ -324,7 +361,7 @@ class ComediaLoRAGenerator:
                     "O teu estilo é acutilante, irónico e subversivo, evitando o humor cliché ou 'seguro' da inteligência artificial. "
                 ),
                 "task_instruction": (
-                    "Escreve um sketch de comédia original para um vídeo (700 a 1000 palavras) sobre o seguinte tema:\n'{query}'\n\n"
+                    "Escreve um sketch de comédia original para um vídeo (500 a 800 palavras) sobre o seguinte tema:\n'{query}'\n\n"
                     "REGRAS OBRIGATÓRIAS:\n"
                     "1. Usa ESTRITAMENTE Português de Portugal (PT-PT), incluindo vocabulário e expressões idiomáticas locais.\n"
                     "2. Usa o formato de guião: [NOME DA PERSONAGEM] em maiúsculas antes das falas e didascálias (indicações cénicas) [entre parênteses retos].\n"
@@ -337,7 +374,7 @@ class ComediaLoRAGenerator:
                     "O teu tom é sarcástico e cheio de referências culturais locais."
                 ),
                 "task_instruction": (
-                    "Escreve um artigo de opinião humorístico e satírico (700 a 1000 palavras) sobre o seguinte tema:\n'{query}'\n\n"
+                    "Escreve um artigo de opinião humorístico e satírico (500 a 800 palavras) sobre o seguinte tema:\n'{query}'\n\n"
                     "REGRAS OBRIGATÓRIAS:\n"
                     "1. Usa ESTRITAMENTE Português de Portugal (PT-PT).\n"
                     "2. Começa com um Título Satírico apelativo.\n"
@@ -351,7 +388,7 @@ class ComediaLoRAGenerator:
                     "O teu humor foca-se na atualidade, no exagero e em expor o absurdo da vida quotidiana e política."
                 ),
                 "task_instruction": (
-                    "Escreve o guião de um monólogo televisivo (700 a 1000 palavras) que relata eventos de forma cómica sobre o seguinte tema:\n'{query}'\n\n"
+                    "Escreve o guião de um monólogo televisivo (500 a 800 palavras) que relata eventos de forma cómica sobre o seguinte tema:\n'{query}'\n\n"
                     "REGRAS OBRIGATÓRIAS:\n"
                     "1. Usa ESTRITAMENTE Português de Portugal (PT-PT).\n"
                     "2. Inclui marcadores de ritmo e interação com a plateia, como [Pausa para risos] ou [O público aplaude].\n"
