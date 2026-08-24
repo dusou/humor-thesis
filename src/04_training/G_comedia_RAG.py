@@ -229,7 +229,7 @@ class ComediaRAG:
         inputs = self.tokenizer(prompt, return_tensors="pt").to(self.model.device)
 
         input_len = inputs["input_ids"].shape[1]
-        cleanup_budget = min(input_len + 100, 4600)
+        cleanup_budget = min(input_len + 50, 3500)
 
         try:
             with torch.inference_mode():
