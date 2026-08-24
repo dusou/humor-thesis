@@ -7,6 +7,10 @@ from pathlib import Path
 import re
 import torch
 import transformers
+from transformers import (
+    StoppingCriteria,
+    StoppingCriteriaList,
+)
 from typing import Dict, Tuple
 
 logging.basicConfig(
@@ -20,6 +24,17 @@ logger = logging.getLogger(__name__)
 transformers.logging.set_verbosity_error()
 os.environ["HF_HUB_DISABLE_TELEMETRY"] = "1"
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+
+
+class ThinkCloseStoppingCriteria(StoppingCriteria):
+    def __init__(self, tokenizer, prompt_len):
+        self.tokenizer = tokenizer
+        self.prompt_len = prompt_len
+
+    def __call__(self, input_ids, scores, **kwargs):
+        tail_ids = input_ids[0, self.prompt_len :]
+        tail_text = self.tokenizer.decode(tail_ids[-8:], skip_special_tokens=False)
+        return "</think>" in tail_text
 
 
 class ComediaBaseline:
@@ -76,10 +91,12 @@ class ComediaBaseline:
                     **inputs,
                     max_new_tokens=reasoning_budget,
                     do_sample=True,
-                    temperature=0.8,
-                    repetition_penalty=1.1,
+                    temperature=0.7,
+                    repetition_penalty=1.05,
                     top_p=0.9,
-                    no_repeat_ngram_size=32,
+                    stopping_criteria=StoppingCriteriaList(
+                        [ThinkCloseStoppingCriteria(self.tokenizer, inputs["input_ids"].shape[1])]
+                    ),
                 )
             reasoning_text = self.tokenizer.decode(
                 out_reasoning[0, inputs["input_ids"].shape[1] :], skip_special_tokens=False
@@ -104,10 +121,9 @@ class ComediaBaseline:
                     **inputs_answer,
                     max_new_tokens=answer_budget,
                     do_sample=True,
-                    temperature=0.7,
-                    repetition_penalty=1.1,
+                    temperature=0.6,
+                    repetition_penalty=1.05,
                     top_p=0.9,
-                    no_repeat_ngram_size=32,
                 )
             answer_text = self.tokenizer.decode(
                 out_answer[0, inputs_answer["input_ids"].shape[1] :], skip_special_tokens=True
@@ -162,7 +178,7 @@ class ComediaBaseline:
         inputs = self.tokenizer(prompt, return_tensors="pt").to(self.model.device)
 
         input_len = inputs["input_ids"].shape[1]
-        cleanup_budget = min(input_len + 100, 4600)
+        cleanup_budget = min(input_len + 50, 3500)
 
         try:
             with self.model.disable_adapter():
@@ -172,9 +188,8 @@ class ComediaBaseline:
                         max_new_tokens=cleanup_budget,
                         do_sample=True,
                         temperature=0.3,
-                        repetition_penalty=1.1,
+                        repetition_penalty=1.05,
                         top_p=0.9,
-                        no_repeat_ngram_size=32,
                     )
                 cleaned = self.tokenizer.decode(out[0, input_len:], skip_special_tokens=True)
         finally:
@@ -189,22 +204,22 @@ class ComediaBaseline:
         """
         Generates comedic text based on the provided query and format.
         """
-        format_mapping = {
+        FORMAT_MAPPING = {
             "sketch": {
                 "system_instruction": "És um argumentista profissional de comédia e sátira portuguesa.",
-                "task_instruction": "escreve um novo sketch de comédia para um vídeo entre 2 e 5 minutos sobre o seguinte tema",
+                "task_instruction": "escreve um novo sketch de comédia para um vídeo entre 500 a 800 palavras sobre o seguinte tema",
             },
             "newspaper": {
                 "system_instruction": "És um cronista satírico a escrever um artigo de opinião para um jornal português.",
-                "task_instruction": "escreve um texto de opinião humorístico e satírico com entre 5 a 12 parágrafos sobre o seguinte tema",
+                "task_instruction": "escreve um texto de opinião humorístico e satírico com entre 500 a 8000 palavras sobre o seguinte tema",
             },
             "tv_show": {
                 "system_instruction": "És o guionista de um programa de televisão humorístico estilo 'late-night' sobre a atualidade portuguesa.",
-                "task_instruction": "escreve o guião de um monólogo televisivo de entre 2 a 5 minutos de duração que relata eventos reais de forma cómica sobre",
+                "task_instruction": "escreve o guião de um monólogo televisivo de entre 500 a 800 palavras de duração que relata eventos reais de forma cómica sobre",
             },
         }
 
-        instructions = format_mapping.get(format_type, format_mapping["sketch"])
+        instructions = FORMAT_MAPPING.get(format_type, FORMAT_MAPPING["sketch"])
 
         if self.dry_run or not self.model:
             return {"text": f"[DRY RUN] Generated mock {format_type} output.", "sources": []}
