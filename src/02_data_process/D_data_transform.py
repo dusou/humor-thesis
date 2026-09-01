@@ -28,6 +28,39 @@ else:
     logger.info("Models missing. Allowing internet access for initial download...")
 
 
+SYSTEM_PROMPT = (
+    "És um argumentista profissional de comédia e sátira portuguesa.\n"
+    "Escreves exclusivamente em Português Europeu (PT-PT), usando o vocabulário, "
+    "a sintaxe e as expressões idiomáticas correntes em Portugal.\n"
+    "O teu humor é observacional, irónico e subversivo: ancoras as piadas na "
+    "realidade social, política e quotidiana portuguesa e escalas o absurdo a "
+    "partir de premissas reconhecíveis.\n"
+    "Nunca explicas a piada depois de a fazeres e "
+    "preferes o risco cómico à segurança de um texto genérico.\n"
+    "Se te forem dados sketches de referência, usa-os apenas como modelo de "
+    "ritmo, cadência e registo, nunca reaproveites as suas falas ou premissas."
+)
+
+MACRO_INSTRUCTION = (
+    "Escreve um sketch de comédia original em Português de Portugal a partir do "
+    "tema e premissa indicados no fim.\n\n"
+    "Antes de escreveres, planeia o arco cómico completo: como abres a cena, que "
+    "mecanismo de ironia ou sátira usas em cada piada, como cada uma escala em "
+    "relação à anterior, e qual é a punchline final. Sê conciso neste plano "
+    "(máximo 15 frases).\n\n"
+    "Regras de escrita:\n"
+    "1. Escreve apenas falas. Cada fala ocupa uma linha própria, precedida pela "
+    "etiqueta do interveniente entre parênteses retos: [INTERVENIENTE]: fala.\n"
+    "2. Fixa os intervenientes no início e mantém-nos até ao fim; não introduzas "
+    "personagens novas a meio do sketch.\n"
+    "3. Constrói uma escalada, isto é, cada piada deve subir a aposta da anterior e "
+    "termina na punchline mais forte.\n"
+    "4. Usa referências culturais portuguesas concretas se possível em vez de genéricas.\n"
+    "5. Extensão alvo: 400 a 900 palavras.\n\n"
+    "Tema e premissa:"
+)
+
+
 class TrainingDataFormatter:
     """
     Transforms Luso-Laugh annotated JSON files into RAG-ready documents
@@ -176,20 +209,26 @@ class TrainingDataFormatter:
         prompt = (
             f'Vais escrever um sketch de comédia portuguesa completo com a seguinte premissa:\n"{premise}"\n\n'
             f"{reference_note}"
-            "Antes de escreveres o sketch, planeia em voz alta, na primeira pessoa e no FUTURO, o arco cómico COMPLETO do texto: "
-            "como vais abrir a cena, que técnica de ironia/sátira vais usar em cada piada sucessiva, como escalam, e como termina a punchline final.\n"
-            "NÃO expliques piadas isoladas -- sintetiza tudo num ÚNICO plano coeso de progressão.\n"
-            "Sê estruturado mas conciso (máximo 8 frases).\n\n"
+            "Antes de escreveres o sketch, planeia em voz alta, na primeira pessoa e no FUTURO, "
+            "o arco cómico COMPLETO.\n\n"
+            "Para CADA piada da escalada, indica explicitamente:\n"
+            "  (a) que expectativa a montagem cria no espectador;\n"
+            "  (b) que elemento viola essa expectativa;\n"
+            "  (c) que lógica interna torna a violação dessa expectativa compreensível em vez de arbitrária.\n\n"
+            "Indica também como cada piada eleva a aposta da anterior e porque é que a "
+            "punchline final é o ponto de maior distância entre expectativa e desfecho.\n"
+            "NÃO expliques piadas isoladas -- sintetiza tudo num ÚNICO plano coeso.\n"
+            "Sê estruturado mas conciso (máximo 15 frases).\n\n"
             "FORMATO OBRIGATÓRIO:\nPLANO: [o teu plano aqui]"
         )
 
         messages = [
             {
                 "role": "system",
-                "content": "És um argumentista profissional de comédia portuguesa a planear a estrutura completa de um novo sketch.",
+                "content": SYSTEM_PROMPT,
             },
             {"role": "user", "content": prompt},
-            {"role": "assistant", "content": "PLANO:"},
+            {"role": "assistant", "content": "PLANO: Vou"},
         ]
 
         try:
@@ -217,7 +256,6 @@ class TrainingDataFormatter:
                 if analysis and "Local LLM Error" not in analysis:
                     punchline_beats.append((line.get("speaker", "UNKNOWN"), line.get("text", ""), analysis))
 
-        macro_instruction = "Escreve um novo sketch de comédia sobre o seguinte tema e premissa:"
         full_transcript = "\n".join([f"[{line.get('speaker', 'UNKNOWN')}]: {line.get('text', '')}" for line in data])
 
         variants = 1 if self.dry_run else self.variants
@@ -231,7 +269,7 @@ class TrainingDataFormatter:
             lora_entry = {
                 "task": "macro",
                 "sketch_id": sketch_id,
-                "instruction": macro_instruction,
+                "instruction": MACRO_INSTRUCTION,
                 "input": summary_input,
                 "output": macro_output,
             }
@@ -250,10 +288,9 @@ class TrainingDataFormatter:
             logger.error(f"Failed to parse {filepath.name}. Skipping.")
             return False, 0
 
-        self.format_for_rag(sketch_id, data)
-
         with open(self.lora_output_file, "a", encoding="utf-8") as lora_f:
             macro_count = self.format_for_lora(sketch_id, data, lora_f)
+        self.format_for_rag(sketch_id, data)
 
         return True, macro_count
 
