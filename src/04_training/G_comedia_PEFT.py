@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 from peft import LoraConfig, PeftModel, prepare_model_for_kbit_training
 import re
+import sys
 import torch
 from tqdm import tqdm
 import transformers
@@ -15,6 +16,9 @@ from transformers import (
     AutoTokenizer,
     BitsAndBytesConfig,
     EarlyStoppingCallback,
+    LogitsProcessor,
+    LogitsProcessorList,
+    set_seed,
     StoppingCriteria,
     StoppingCriteriaList,
 )
@@ -32,8 +36,18 @@ transformers.logging.set_verbosity_error()
 os.environ["HF_HUB_DISABLE_TELEMETRY"] = "1"
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
+data_process_dir = (Path(__file__).resolve().parent.parent / "02_data_process").resolve()
+if str(data_process_dir) not in sys.path:
+    sys.path.insert(0, str(data_process_dir))
+
+from D_data_transform import MACRO_INSTRUCTION, SYSTEM_PROMPT
+
 
 class ThinkCloseStoppingCriteria(StoppingCriteria):
+    """
+    Thinking Block stopping criteria
+    """
+
     def __init__(self, tokenizer, prompt_len):
         self.tokenizer = tokenizer
         self.prompt_len = prompt_len
@@ -42,6 +56,25 @@ class ThinkCloseStoppingCriteria(StoppingCriteria):
         tail_ids = input_ids[0, self.prompt_len :]
         tail_text = self.tokenizer.decode(tail_ids[-8:], skip_special_tokens=False)
         return "</think>" in tail_text
+
+
+class PresencePenaltyLogitsProcessor(LogitsProcessor):
+    """
+    Presence penalty: a flat subtraction from the logit of
+    any token already generated. Unlike repetition_penalty this only penalises the model's
+    own output (recommended by Qwen3.5 card for endless repetition)
+    """
+
+    def __init__(self, penalty: float, prompt_len: int):
+        self.penalty = penalty
+        self.prompt_len = prompt_len
+
+    def __call__(self, input_ids, scores):
+        generated = input_ids[:, self.prompt_len :]
+        for i in range(scores.shape[0]):
+            if generated[i].numel():
+                scores[i, torch.unique(generated[i])] -= self.penalty
+        return scores
 
 
 class ComediaLoRATrainer:
@@ -65,14 +98,11 @@ class ComediaLoRATrainer:
         self.adapter_name = f"comedia_lora_r{self.rank}"
 
     def _format_chatml(self, example: Dict[str, List[str]]) -> dict:
-        sys_msg = "És um argumentista profissional de comédia e sátira portuguesa."
-        user_msg = f"{example['instruction']}\n\n{example['input']}"
-        assistant_msg = example["output"]
         return {
             "messages": [
-                {"role": "system", "content": sys_msg},
-                {"role": "user", "content": user_msg},
-                {"role": "assistant", "content": assistant_msg},
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": f"{example['instruction']}\n\n{example['input']}"},
+                {"role": "assistant", "content": example["output"]},
             ]
         }
 
@@ -89,7 +119,7 @@ class ComediaLoRATrainer:
             remove_columns=dataset.column_names,
         )
 
-        split_dataset = full_dataset.train_test_split(test_size=0.05, seed=42)
+        split_dataset = full_dataset.train_test_split(test_size=0.1, seed=42)
         train_data = split_dataset["train"]
         eval_data = split_dataset["test"]
         logger.info(f"Training on {len(train_data)} examples, evaluating on {len(eval_data)} examples.")
@@ -119,36 +149,55 @@ class ComediaLoRATrainer:
         model.config.use_cache = False
 
         # Dynamic alpha scaling based on rank
-        lora_alpha = self.rank
+        lora_alpha = self.rank * 2
         logger.info(f"Applying LoRA config (rank={self.rank}, alpha={lora_alpha})")
 
         lora_config = LoraConfig(
             r=self.rank,
             lora_alpha=lora_alpha,
-            target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
-            lora_dropout=0.05,
+            target_modules=[
+                "down_proj",
+                "gate_proj",
+                "in_proj_a",
+                "in_proj_b",
+                "in_proj_qkv",
+                "in_proj_z",
+                "k_proj",
+                "o_proj",
+                "out_proj",
+                "q_proj",
+                "up_proj",
+                "v_proj",
+            ],
+            lora_dropout=0.1,
             bias="none",
             task_type="CAUSAL_LM",
+            use_rslora=True,
         )
 
         training_args = SFTConfig(
-            output_dir=str(self.output_dir / "checkpoints"),
+            output_dir=str(self.output_dir / f"checkpoints_r{self.rank}"),
             per_device_train_batch_size=2,
             gradient_accumulation_steps=4,
             gradient_checkpointing=True,
             learning_rate=2e-4,
+            weight_decay=0.01,
             lr_scheduler_type="cosine",
-            num_train_epochs=7,
+            num_train_epochs=15,
             logging_steps=10,
             eval_strategy="steps",
             eval_steps=20,
-            save_steps=20,
+            per_device_eval_batch_size=2,
+            eval_accumulation_steps=1,
+            save_steps=40,
+            save_total_limit=2,
             load_best_model_at_end=True,
             metric_for_best_model="eval_loss",
             optim="adamw_torch",
             bf16=True,
-            warmup_ratio=0.03,
-            report_to="none",
+            seed=42,
+            warmup_ratio=0.1,
+            report_to="tensorboard",
             max_length=4096,
             assistant_only_loss=True,
             dataloader_num_workers=4,
@@ -239,22 +288,24 @@ class ComediaLoRAGenerator:
 
         try:
             with torch.inference_mode():
+                prompt_len = inputs["input_ids"].shape[1]
                 out_reasoning = self.model.generate(
                     **inputs,
                     max_new_tokens=reasoning_budget,
                     do_sample=True,
-                    temperature=0.7,
-                    repetition_penalty=1.05,
-                    top_p=0.9,
-                    stopping_criteria=StoppingCriteriaList(
-                        [ThinkCloseStoppingCriteria(self.tokenizer, inputs["input_ids"].shape[1])]
-                    ),
+                    temperature=1.0,
+                    top_p=0.95,
+                    top_k=20,
+                    min_p=0.0,
+                    repetition_penalty=1.0,
+                    logits_processor=LogitsProcessorList([PresencePenaltyLogitsProcessor(1.5, prompt_len)]),
+                    stopping_criteria=StoppingCriteriaList([ThinkCloseStoppingCriteria(self.tokenizer, prompt_len)]),
                 )
             reasoning_text = self.tokenizer.decode(
                 out_reasoning[0, inputs["input_ids"].shape[1] :], skip_special_tokens=False
             )
         finally:
-            del inputs, out_reasoning
+            del inputs
             gc.collect()
             torch.cuda.synchronize()
             torch.cuda.empty_cache()
@@ -262,25 +313,31 @@ class ComediaLoRAGenerator:
         if "</think>" in reasoning_text:
             reasoning_text = reasoning_text.split("</think>")[0] + "</think>\n\n"
         else:
+            logger.info("Reasoning hit its token budget. Forcing closure.")
             reasoning_text = f"<think>{reasoning_text.split('<think>')[-1]}\n</think>\n\n"
 
         inputs_answer = self.tokenizer(prompt + reasoning_text, return_tensors="pt").to(self.model.device)
 
         try:
             with torch.inference_mode():
+                prompt_len = inputs_answer["input_ids"].shape[1]
                 out_answer = self.model.generate(
                     **inputs_answer,
                     max_new_tokens=answer_budget,
+                    min_new_tokens=200,
                     do_sample=True,
-                    temperature=0.6,
-                    repetition_penalty=1.05,
-                    top_p=0.9,
+                    temperature=0.8,
+                    top_p=0.95,
+                    top_k=20,
+                    min_p=0.0,
+                    repetition_penalty=1.0,
+                    logits_processor=LogitsProcessorList([PresencePenaltyLogitsProcessor(1.5, prompt_len)]),
                 )
-            answer_text = self.tokenizer.decode(
-                out_answer[0, inputs_answer["input_ids"].shape[1] :], skip_special_tokens=True
-            )
+                answer_text = self.tokenizer.decode(
+                    out_answer[0, inputs_answer["input_ids"].shape[1] :], skip_special_tokens=True
+                )
         finally:
-            del inputs_answer, out_answer
+            del inputs_answer
             gc.collect()
             torch.cuda.synchronize()
             torch.cuda.empty_cache()
@@ -346,7 +403,7 @@ class ComediaLoRAGenerator:
                     )
                 cleaned = self.tokenizer.decode(out[0, input_len:], skip_special_tokens=True)
         finally:
-            del inputs, out
+            del inputs
             gc.collect()
             torch.cuda.synchronize()
             torch.cuda.empty_cache()
@@ -354,62 +411,15 @@ class ComediaLoRAGenerator:
         return re.sub(r"^(?:assistant\s*)+", "", cleaned.strip(), flags=re.IGNORECASE)
 
     def generate(self, query: str, format_type: str = "sketch") -> Dict:
-        format_mapping = {
-            "sketch": {
-                "system_instruction": (
-                    "És um guionista profissional de comédia e sátira em Português de Portugal. "
-                    "O teu estilo é acutilante, irónico e subversivo, evitando o humor cliché ou 'seguro' da inteligência artificial. "
-                ),
-                "task_instruction": (
-                    "Escreve um sketch de comédia original para um vídeo (500 a 800 palavras) sobre o seguinte tema:\n'{query}'\n\n"
-                    "REGRAS OBRIGATÓRIAS:\n"
-                    "1. Usa ESTRITAMENTE Português de Portugal (PT-PT), incluindo vocabulário e expressões idiomáticas locais.\n"
-                    "2. Usa o formato de guião: [NOME DA PERSONAGEM] em maiúsculas antes das falas e didascálias (indicações cénicas) [entre parênteses retos].\n"
-                    "3. Usa o teu raciocínio para planear a ironia, a escalada do absurdo e as 'punchlines' antes de escreveres o guião final."
-                ),
-            },
-            "newspaper": {
-                "system_instruction": (
-                    "És um cronista satírico mordaz a escrever para um jornal português de renome. "
-                    "O teu tom é sarcástico e cheio de referências culturais locais."
-                ),
-                "task_instruction": (
-                    "Escreve um artigo de opinião humorístico e satírico (500 a 800 palavras) sobre o seguinte tema:\n'{query}'\n\n"
-                    "REGRAS OBRIGATÓRIAS:\n"
-                    "1. Usa ESTRITAMENTE Português de Portugal (PT-PT).\n"
-                    "2. Começa com um Título Satírico apelativo.\n"
-                    "3. Evita conclusões moralistas ou genéricas; mantém a ironia até à última frase.\n"
-                    "4. Usa o teu raciocínio para planear o ângulo crítico e os argumentos absurdos antes de escreveres o texto."
-                ),
-            },
-            "tv_show": {
-                "system_instruction": (
-                    "És o apresentador e guionista principal de um programa de televisão humorístico estilo 'late-night' em Portugal. "
-                    "O teu humor foca-se na atualidade, no exagero e em expor o absurdo da vida quotidiana e política."
-                ),
-                "task_instruction": (
-                    "Escreve o guião de um monólogo televisivo (500 a 800 palavras) que relata eventos de forma cómica sobre o seguinte tema:\n'{query}'\n\n"
-                    "REGRAS OBRIGATÓRIAS:\n"
-                    "1. Usa ESTRITAMENTE Português de Portugal (PT-PT).\n"
-                    "2. Inclui marcadores de ritmo e interação com a plateia, como [Pausa para risos] ou [O público aplaude].\n"
-                    "3. Cria uma narrativa fluida que salte de uma observação absurda para a próxima.\n"
-                    "4. Usa o teu raciocínio para estruturar o ritmo antes de iniciares o monólogo."
-                ),
-            },
-        }
-
-        instructions = format_mapping.get(format_type, format_mapping["sketch"])
-
         if self.dry_run or not self.model:
             return {"text": f"[DRY RUN] Generated mock {format_type} output.", "sources": []}
 
         try:
             messages = [
-                {"role": "system", "content": f"{instructions['system_instruction']}\n..."},
-                {"role": "user", "content": instructions["task_instruction"].format(query=query)},
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": f"{MACRO_INSTRUCTION}\n\n{query}"},
             ]
             reasoning, response = self._generate_bounded(messages)
-            clean_response = response
             clean_response = self._cleanup_pass(format_type, response)
             print("===/ AFTER CLEANUP /====" + clean_response)
             return {"text": clean_response, "sources": [], "reasoning": reasoning, "response_without_cleanup": response}
@@ -431,8 +441,8 @@ if __name__ == "__main__":
         "--rank",
         type=int,
         default=16,
-        choices=[8, 16, 32, 64],
-        help="LoRA rank dimension. Alpha will be set to rank * 2.",
+        choices=[4, 8, 16, 32, 64],
+        help="LoRA rank dimension. Alpha will be set to rank value.",
     )
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
@@ -445,6 +455,7 @@ if __name__ == "__main__":
         trainer.train()
 
     elif args.mode == "generate":
+        set_seed(42)
         logger.info(f"Initializing LoRA Generator (Target Rank {args.rank})...")
         input_path = (script_dir / "input_prompts.json").resolve()
         output_path = (script_dir / f"../../data/06_comedia_outputs/ComedIA_PEFT_r{args.rank}_outputs.json").resolve()
@@ -477,6 +488,7 @@ if __name__ == "__main__":
                     "format": format_type,
                     "prompt": prompt,
                     "reasoning": generation_result.get("reasoning", ""),
+                    "uncleaned_output": generation_result.get("response_without_cleanup", ""),
                     "output": generation_result["text"],
                 }
             )
