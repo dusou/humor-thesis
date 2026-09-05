@@ -58,22 +58,21 @@ class ThinkCloseStoppingCriteria(StoppingCriteria):
         return "</think>" in tail_text
 
 
-class PresencePenaltyLogitsProcessor(LogitsProcessor):
-    """
-    Presence penalty: a flat subtraction from the logit of
-    any token already generated. Unlike repetition_penalty this only penalises the model's
-    own output (recommended by Qwen3.5 card for endless repetition)
-    """
+class RepetitionControlProcessor(LogitsProcessor):
+    """Presence is flat; frequency scales with count and is what breaks a
+    running loop. Cap keeps common function words usable in long generations."""
 
-    def __init__(self, penalty: float, prompt_len: int):
-        self.penalty = penalty
-        self.prompt_len = prompt_len
+    def __init__(self, presence, frequency, prompt_len, max_freq=2.0):
+        self.presence, self.frequency = presence, frequency
+        self.prompt_len, self.max_freq = prompt_len, max_freq
 
     def __call__(self, input_ids, scores):
-        generated = input_ids[:, self.prompt_len :]
+        gen = input_ids[:, self.prompt_len :]
         for i in range(scores.shape[0]):
-            if generated[i].numel():
-                scores[i, torch.unique(generated[i])] -= self.penalty
+            if not gen[i].numel():
+                continue
+            toks, counts = torch.unique(gen[i], return_counts=True)
+            scores[i, toks] -= self.presence + torch.clamp(self.frequency * counts.to(scores.dtype), max=self.max_freq)
         return scores
 
 
@@ -97,6 +96,24 @@ class ComediaLoRATrainer:
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.adapter_name = f"comedia_lora_r{self.rank}"
 
+    def _list_checkpoints(self, ckpt_dir: Path) -> list:
+        rows = []
+        for d in sorted(ckpt_dir.glob("checkpoint-*"), key=lambda p: int(p.name.split("-")[1])):
+            state_file = d / "trainer_state.json"
+            if not state_file.exists():
+                continue
+            state = json.loads(state_file.read_text(encoding="utf-8"))
+            losses = [h["eval_loss"] for h in state.get("log_history", []) if "eval_loss" in h]
+            rows.append(
+                {
+                    "path": d,
+                    "step": int(d.name.split("-")[1]),
+                    "epoch": round(state.get("epoch", 0.0), 2),
+                    "eval_loss": round(losses[-1], 4) if losses else None,
+                }
+            )
+        return rows
+
     def _format_chatml(self, example: Dict[str, List[str]]) -> dict:
         return {
             "messages": [
@@ -106,20 +123,90 @@ class ComediaLoRATrainer:
             ]
         }
 
-    def train(self) -> None:
-        if not self.dataset_path.exists():
-            logger.error(f"Dataset not found at {self.dataset_path}")
-            return
-
-        logger.info(f"Loading dataset from {self.dataset_path}")
+    def _load_split(self):
         dataset = load_dataset("json", data_files=str(self.dataset_path), split="train")
         full_dataset = dataset.map(
             self._format_chatml,
             batched=False,
             remove_columns=dataset.column_names,
         )
+        return full_dataset.train_test_split(test_size=0.1, seed=42)
 
-        split_dataset = full_dataset.train_test_split(test_size=0.1, seed=42)
+    def evaluate_checkpoint(self, adapter_path: Path) -> dict:
+        """Eval loss on the split, with and without the adapter."""
+        if not adapter_path.exists():
+            logger.error(f"Adapter not found at {adapter_path}")
+            return {}
+
+        eval_data = self._load_split()["test"]
+        logger.info(f"Evaluating {adapter_path.name} on {len(eval_data)} held-out examples")
+
+        tokenizer = AutoTokenizer.from_pretrained(self.model_name, token=self.hf_token)
+        tokenizer.pad_token = tokenizer.eos_token
+        tokenizer.padding_side = "right"
+
+        bnb_config = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_use_double_quant=True,
+            bnb_4bit_quant_type="nf4",
+            bnb_4bit_compute_dtype=torch.bfloat16,
+        )
+        base_model = AutoModelForCausalLM.from_pretrained(
+            self.model_name,
+            quantization_config=bnb_config,
+            device_map="auto",
+            token=self.hf_token,
+            attn_implementation="sdpa",
+        )
+        model = PeftModel.from_pretrained(base_model, str(adapter_path))
+        model.eval()
+
+        args = SFTConfig(
+            output_dir=str(self.output_dir / "eval_tmp"),
+            per_device_eval_batch_size=4,
+            eval_accumulation_steps=1,
+            bf16=True,
+            max_length=4096,
+            assistant_only_loss=True,
+            report_to="none",
+        )
+        trainer = SFTTrainer(
+            model=model,
+            train_dataset=eval_data,  # unused
+            eval_dataset=eval_data,
+            processing_class=tokenizer,
+            args=args,
+        )
+
+        lora_metrics = trainer.evaluate(metric_key_prefix="lora")
+        with model.disable_adapter():
+            base_metrics = trainer.evaluate(metric_key_prefix="base")
+
+        lora_loss = lora_metrics["lora_loss"]
+        base_loss = base_metrics["base_loss"]
+        result = {
+            "adapter": adapter_path.name,
+            "base_loss": base_loss,
+            "lora_loss": lora_loss,
+            "delta": base_loss - lora_loss,
+            "base_ppl": float(torch.exp(torch.tensor(base_loss))),
+            "lora_ppl": float(torch.exp(torch.tensor(lora_loss))),
+            "base_token_acc": base_metrics.get("base_mean_token_accuracy"),
+            "lora_token_acc": lora_metrics.get("lora_mean_token_accuracy"),
+        }
+        logger.info(
+            f"base {base_loss:.4f} (ppl {result['base_ppl']:.2f})  ->  "
+            f"lora {lora_loss:.4f} (ppl {result['lora_ppl']:.2f})  |  Δ {result['delta']:+.4f}"
+        )
+        return result
+
+    def train(self) -> None:
+        if not self.dataset_path.exists():
+            logger.error(f"Dataset not found at {self.dataset_path}")
+            return
+
+        logger.info(f"Loading dataset from {self.dataset_path}")
+        split_dataset = self._load_split()
         train_data = split_dataset["train"]
         eval_data = split_dataset["test"]
         logger.info(f"Training on {len(train_data)} examples, evaluating on {len(eval_data)} examples.")
@@ -172,7 +259,7 @@ class ComediaLoRATrainer:
             lora_dropout=0.1,
             bias="none",
             task_type="CAUSAL_LM",
-            use_rslora=True,
+            use_rslora=False,
         )
 
         training_args = SFTConfig(
@@ -183,20 +270,22 @@ class ComediaLoRATrainer:
             learning_rate=2e-4,
             weight_decay=0.01,
             lr_scheduler_type="cosine",
-            num_train_epochs=15,
+            num_train_epochs=10,
             logging_steps=10,
             eval_strategy="steps",
             eval_steps=20,
             per_device_eval_batch_size=2,
             eval_accumulation_steps=1,
-            save_steps=40,
-            save_total_limit=2,
+            save_steps=20,
+            save_total_limit=6,
+            save_only_model=True,
             load_best_model_at_end=True,
             metric_for_best_model="eval_loss",
+            greater_is_better=False,
             optim="adamw_torch",
             bf16=True,
             seed=42,
-            warmup_ratio=0.1,
+            warmup_steps=20,
             report_to="tensorboard",
             max_length=4096,
             assistant_only_loss=True,
@@ -210,8 +299,17 @@ class ComediaLoRATrainer:
             peft_config=lora_config,
             processing_class=tokenizer,
             args=training_args,
-            callbacks=[EarlyStoppingCallback(early_stopping_patience=3)],
+            callbacks=[EarlyStoppingCallback(early_stopping_patience=5)],
         )
+
+        trainer.model.print_trainable_parameters()
+        attached = {n.split(".lora_A")[0].split(".")[-1] for n, _ in trainer.model.named_modules() if ".lora_A" in n}
+        logger.info(f"LoRA attached to: {sorted(attached)}")
+        missing = set(lora_config.target_modules) - attached
+        if missing:
+            logger.warning(f"target_modules never matched: {sorted(missing)}")
+        else:
+            logger.info("all target_modules matched")
 
         logger.info("Starting LoRA Fine-Tuning...")
         train_result = trainer.train()
@@ -279,7 +377,7 @@ class ComediaLoRAGenerator:
             self.model = None
 
     def _generate_bounded(
-        self, messages: list, reasoning_budget: int = 2000, answer_budget: int = 2000
+        self, messages: list, reasoning_budget: int = 3000, answer_budget: int = 2500
     ) -> Tuple[str, str]:
         prompt = self.tokenizer.apply_chat_template(
             messages, tokenize=False, add_generation_prompt=True, enable_thinking=True
@@ -298,7 +396,7 @@ class ComediaLoRAGenerator:
                     top_k=20,
                     min_p=0.0,
                     repetition_penalty=1.0,
-                    logits_processor=LogitsProcessorList([PresencePenaltyLogitsProcessor(1.5, prompt_len)]),
+                    logits_processor=LogitsProcessorList([RepetitionControlProcessor(1.0, 0.3, prompt_len)]),
                     stopping_criteria=StoppingCriteriaList([ThinkCloseStoppingCriteria(self.tokenizer, prompt_len)]),
                 )
             reasoning_text = self.tokenizer.decode(
@@ -324,14 +422,13 @@ class ComediaLoRAGenerator:
                 out_answer = self.model.generate(
                     **inputs_answer,
                     max_new_tokens=answer_budget,
-                    min_new_tokens=200,
                     do_sample=True,
                     temperature=0.8,
                     top_p=0.95,
                     top_k=20,
                     min_p=0.0,
                     repetition_penalty=1.0,
-                    logits_processor=LogitsProcessorList([PresencePenaltyLogitsProcessor(1.5, prompt_len)]),
+                    logits_processor=LogitsProcessorList([RepetitionControlProcessor(1.0, 0.3, prompt_len)]),
                 )
                 answer_text = self.tokenizer.decode(
                     out_answer[0, inputs_answer["input_ids"].shape[1] :], skip_special_tokens=True
@@ -421,11 +518,20 @@ class ComediaLoRAGenerator:
             ]
             reasoning, response = self._generate_bounded(messages)
             clean_response = self._cleanup_pass(format_type, response)
-            print("===/ AFTER CLEANUP /====" + clean_response)
-            return {"text": clean_response, "sources": [], "reasoning": reasoning, "response_without_cleanup": response}
+            return {
+                "response": response,
+                "sources": [],
+                "reasoning": reasoning,
+                "response_with_cleanup": clean_response,
+            }
         except Exception as e:
             logger.error(f"Generation failed: {e}")
-            return {"text": "ERROR: Generation failed.", "sources": []}
+            return {
+                "response": "ERROR: Generation failed.",
+                "sources": [],
+                "reasoning": "ERROR: Generation failed.",
+                "response_with_cleanup": "ERROR: Generation failed.",
+            }
 
 
 if __name__ == "__main__":
@@ -433,7 +539,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--mode",
         type=str,
-        choices=["train", "generate"],
+        choices=["train", "generate", "eval"],
         required=True,
         help="Select 'train' to fine-tune or 'generate' to batch process prompts.",
     )
@@ -442,7 +548,13 @@ if __name__ == "__main__":
         type=int,
         default=16,
         choices=[4, 8, 16, 32, 64],
-        help="LoRA rank dimension. Alpha will be set to rank value.",
+        help="LoRA rank dimension. Alpha will be set to rank value * 2.",
+    )
+    parser.add_argument(
+        "--adapter-path",
+        type=str,
+        default=None,
+        help="Override the adapter used. Accepts a checkpoint dir, e.g. adapters/checkpoints_r16/checkpoint-120",
     )
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
@@ -458,8 +570,13 @@ if __name__ == "__main__":
         set_seed(42)
         logger.info(f"Initializing LoRA Generator (Target Rank {args.rank})...")
         input_path = (script_dir / "input_prompts.json").resolve()
-        output_path = (script_dir / f"../../data/06_comedia_outputs/ComedIA_PEFT_r{args.rank}_outputs.json").resolve()
-        adapter_path = (script_dir / "adapters" / f"comedia_lora_r{args.rank}").resolve()
+        adapter_path = (
+            Path(args.adapter_path).resolve()
+            if args.adapter_path
+            else (script_dir / "adapters" / f"comedia_lora_r{args.rank}").resolve()
+        )
+        tag = adapter_path.name if args.adapter_path else f"r{args.rank}"
+        output_path = (script_dir / f"../../data/06_comedia_outputs/ComedIA_PEFT_{tag}_outputs.json").resolve()
 
         if not input_path.exists():
             logger.error(f"Input file '{input_path}' not found.")
@@ -488,8 +605,8 @@ if __name__ == "__main__":
                     "format": format_type,
                     "prompt": prompt,
                     "reasoning": generation_result.get("reasoning", ""),
-                    "uncleaned_output": generation_result.get("response_without_cleanup", ""),
-                    "output": generation_result["text"],
+                    "clean_output": generation_result.get("response_with_cleanup", ""),
+                    "output": generation_result["response"],
                 }
             )
 
@@ -497,3 +614,18 @@ if __name__ == "__main__":
             json.dump(output_data, f, ensure_ascii=False, indent=4)
 
         logger.info(f"Generation complete! Results saved to {output_path.name}")
+
+    elif args.mode == "eval":
+        trainer = ComediaLoRATrainer(rank=args.rank)
+        default = trainer.output_dir / trainer.adapter_name
+        targets = (
+            [Path(args.adapter_path).resolve()]
+            if args.adapter_path
+            else [default]
+            + [c["path"] for c in trainer._list_checkpoints(trainer.output_dir / f"checkpoints_r{args.rank}")]
+        )
+        results = [trainer.evaluate_checkpoint(p) for p in targets]
+        results = [r for r in results if r]
+        out = script_dir / f"eval_r{args.rank}.json"
+        out.write_text(json.dumps(results, ensure_ascii=False, indent=2), encoding="utf-8")
+        logger.info(f"Wrote {out}")
