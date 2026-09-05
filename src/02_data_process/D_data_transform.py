@@ -2,7 +2,9 @@ import argparse
 import json
 import logging
 import os
+import pandas as pd
 from pathlib import Path
+import re
 import torch
 import transformers
 
@@ -44,19 +46,19 @@ SYSTEM_PROMPT = (
 MACRO_INSTRUCTION = (
     "Escreve um sketch de comédia original em Português de Portugal a partir do "
     "tema e premissa indicados no fim.\n\n"
-    "Antes de escreveres, planeia o arco cómico completo: como abres a cena, que "
-    "mecanismo de ironia ou sátira usas em cada piada, como cada uma escala em "
-    "relação à anterior, e qual é a punchline final. Sê conciso neste plano "
-    "(máximo 15 frases).\n\n"
+    "Antes de escreveres, planeia o arco cómico completo seguindo a estrutura: "
+    "ELENCO, ABORDAGEM REJEITADA, ARCO CÓMICO (com expectativa, violação e "
+    "lógica interna para cada piada) e ESCALADA. Extensão do plano: 25 a 30 frases.\n\n"
     "Regras de escrita:\n"
-    "1. Escreve apenas falas. Cada fala ocupa uma linha própria, precedida pela "
-    "etiqueta do interveniente entre parênteses retos: [INTERVENIENTE]: fala.\n"
-    "2. Fixa os intervenientes no início e mantém-nos até ao fim; não introduzas "
-    "personagens novas a meio do sketch.\n"
-    "3. Constrói uma escalada, isto é, cada piada deve subir a aposta da anterior e "
-    "termina na punchline mais forte.\n"
-    "4. Usa referências culturais portuguesas concretas se possível em vez de genéricas.\n"
-    "5. Extensão alvo: 400 a 900 palavras.\n\n"
+    "1. Escreve o guião em falas. Cada fala ocupa uma linha própria, precedida "
+    "pelo nome da personagem em maiúsculas entre parênteses retos: [NOME]: fala.\n"
+    "2. Podes acrescentar didascálias breves em linha própria, entre parênteses "
+    "retos e sem dois pontos, no máximo uma por cada seis falas.\n"
+    "3. Fixa as personagens no início e mantém-nas até ao fim.\n"
+    "4. Constrói uma escalada: cada piada deve subir a aposta da anterior e "
+    "terminar na punchline mais forte.\n"
+    "5. Usa referências culturais portuguesas concretas em vez de genéricas.\n"
+    "6. Extensão alvo: 500 a 900 palavras.\n\n"
     "Tema e premissa:"
 )
 
@@ -108,27 +110,148 @@ class TrainingDataFormatter:
             logger.error(f"Failed to load local LLM: {e}")
             self.llm_pipeline = None
 
-    def format_for_rag(self, sketch_id: str, data: list):
+    def _merge_turns(self, data: list) -> list:
+        """Collapse consecutive segments from the same speaker so one line is one turn."""
+        turns = []
+        for line in data:
+            spk = line.get("speaker", "UNKNOWN")
+            txt = (line.get("text") or "").strip()
+            if not txt:
+                continue
+            if turns and turns[-1][0] == spk:
+                turns[-1][1] += " " + txt
+            else:
+                turns.append([spk, txt])
+        return turns
+
+    def _generate_script(self, sketch_id: str, transcript: str) -> str:
+        """Convert a diarised transcript into a script with named characters
+        and sparse stage directions. Falls back to the raw transcript on any
+        anomaly, so downstream code always receives a valid script."""
+        if self.dry_run or not self.llm_pipeline:
+            return transcript
+
+        original_turns = [
+            (m.group(1), m.group(2))
+            for m in (re.match(r"^\[([^\]]+)\]:\s*(.*)$", ln.strip()) for ln in transcript.split("\n"))
+            if m
+        ]
+        if not original_turns:
+            return transcript
+
+        speakers = list({s for s, _ in original_turns})
+        first_line_text = original_turns[0][1]
+
+        prompt = (
+            "Abaixo está a transcrição diarizada de um sketch de comédia portuguesa.\n"
+            f"Etiquetas de interveniente presentes: {', '.join(speakers)}.\n\n"
+            "TAREFA\n"
+            "Reescreve a transcrição como guião, aplicando exactamente estas transformações:\n"
+            "1. Antes de reescrever, decide um nome para CADA etiqueta que aparece na "
+            "transcrição. Escreve essa correspondência primeiro, no formato:\n"
+            "   SPEAKER_00 -> NOME1\n"
+            "   SPEAKER_01 -> NOME2\n"
+            "   (uma linha por cada etiqueta distinta)\n"
+            "   Depois escreve o guião usando esses nomes. NUNCA dês o mesmo nome a "
+            "etiquetas diferentes.\n"
+            "2. Formata cada fala como uma linha, no formato exacto:\n"
+            "   [NOME]: fala\n"
+            "3. Onde o conteúdo o implicar de forma inequívoca, podes acrescentar didascálias muito breves "
+            "em linha própria, entre parênteses retos, sem dois pontos, ex.:\n"
+            "   [Olha para a fatura com horror.]\n"
+            "   No máximo uma didascália por cada seis falas.\n\n"
+            "REGRAS ABSOLUTAS\n"
+            "- Preserva LITERALMENTE cada palavra do texto original, pela mesma ordem. "
+            "Não reescrevas, não reformules, não corrijas gramática, não substituas sinónimos.\n"
+            "- Podes DIVIDIR uma fala longa em várias linhas se ela contiver claramente "
+            "várias intervenções separadas (por exemplo, um narrador que muda de tópico, "
+            "ou momentos em que o mesmo interveniente muda de registo).\n"
+            "- Podes acrescentar didascálias breves em linha própria, entre parênteses "
+            "retos e sem dois pontos.\n"
+            "- Não inventes acontecimentos que o texto não implique.\n"
+            f"--- TRANSCRIÇÃO ({len(original_turns)} falas) ---\n{transcript}\n--- FIM ---"
+        )
+
+        messages = [
+            {
+                "role": "system",
+                "content": "És um argumentista que converte transcrições em guiões, preservando cada fala.",
+            },
+            {"role": "user", "content": prompt},
+            {"role": "assistant", "content": "["},
+        ]
+
+        try:
+            outputs = self.llm_pipeline(
+                messages,
+                temperature=0.3,
+                max_new_tokens=4096,
+                do_sample=True,
+                continue_final_message=True,
+            )
+            raw = "[" + outputs[0]["generated_text"][-1]["content"]
+        except Exception as e:
+            logger.warning(f"{sketch_id}: script enrichment call failed ({e}). Using transcript.")
+            return transcript
+
+        script = self._sanitize_script(raw)
+
+        # Line-count guard. Model must have kept roughly all the turns.
+        script_turns = [l for l in script.split("\n") if re.match(r"^\[[A-ZÁÂÃÀÇÉÊÍÓÔÕÚ][^\]]*\]:\s*.+", l.strip())]
+        n_in, n_out = len(original_turns), len(script_turns)
+        input_chars = len(transcript)
+        output_chars = sum(len(t) for t in script_turns)
+        if output_chars < 0.60 * input_chars or output_chars > 1.40 * input_chars:
+            logger.warning(
+                f"{sketch_id}: script content changed by {output_chars / input_chars:.0%} "
+                f"({input_chars} -> {output_chars} chars). Using transcript."
+            )
+            return transcript
+        if n_out < n_in:
+            logger.warning(f"{sketch_id}: script lost turns ({n_in} -> {n_out}). Using transcript.")
+            return transcript
+
+        # Format regression guard. Did the model reintroduce SPEAKER_NN tags?
+        if re.search(r"\[SPEAKER_\d+\]", script):
+            logger.warning(f"{sketch_id}: script still contains SPEAKER_NN tags. Using transcript.")
+            return transcript
+
+        logger.info(f"Enriched {sketch_id}: {n_in} turns -> {n_out} lines")
+        return script
+
+    def _sanitize_script(self, raw: str) -> str:
+        """Strip markdown the model sometimes emits."""
+        text = raw.strip()
+        text = re.sub(r"^\[\[", "[", text, flags=re.MULTILINE)  # collapse double brackets
+        text = re.sub(r"\*\*", "", text)  # bold markers
+        text = re.sub(r"^```.*?\n", "", text)  # opening code fence
+        text = re.sub(r"\n```$", "", text)  # closing code fence
+        # Drop any leading lines before the first line
+        lines = text.split("\n")
+        for i, l in enumerate(lines):
+            if re.match(r"^\[[A-ZÁÂÃÀÇÉÊÍÓÔÕÚ][^\]]*\]", l.strip()):
+                return "\n".join(lines[i:]).strip()
+        return text
+
+    def _render_script(self, data: list) -> str:
+        return "\n".join(f"[{s}]: {t}" for s, t in self._merge_turns(data))
+
+    def format_for_rag(self, sketch_id: str, enriched_script: str, data: list):
         """
         Aggregates the sketch into a single document, appending all successful
         humor analyses to provide semantic anchors for the vector database.
         """
-        full_text_lines = []
         analyses = []
-
-        for line in data:
-            speaker = line.get("speaker", "UNKNOWN")
-            text = line.get("text", "")
-            full_text_lines.append(f"[{speaker}]: {text}")
-
+        for line in data:  # segment-level, punchline flags intact
             if line.get("is_punchline", False):
                 analysis = line.get("semantic_metadata", {}).get("humor_analysis")
                 if analysis and "Local LLM Error" not in analysis:
+                    text = line.get("text", "")
                     analyses.append(f"Analysis of '{text}': {analysis}")
 
         rag_document = {
             "sketch_id": sketch_id,
-            "content": "\n".join(full_text_lines),
+            "content": enriched_script,
             "comedic_metadata": "\n".join(analyses),
         }
 
@@ -136,18 +259,15 @@ class TrainingDataFormatter:
         with open(out_path, "w", encoding="utf-8") as f:
             json.dump(rag_document, f, ensure_ascii=False, indent=4)
 
-    def _generate_synthetic_summary(self, sketch_id: str, data: list) -> str:
-        speakers = list({line.get("speaker", "UNKNOWN") for line in data})
-        fallback_summary = f"Um sketch de comédia portuguesa envolvendo uma interação entre {', '.join(speakers)}."
+    def _generate_synthetic_summary(self, sketch_id: str, script: str) -> str:
+        fallback_summary = "Um sketch de comédia portuguesa."
 
         if self.dry_run or not self.llm_pipeline:
             return fallback_summary
 
-        full_transcript = "\n".join([f"[{line.get('speaker', 'UNKNOWN')}]: {line.get('text', '')}" for line in data])
-
         prompt = (
             "Lê a seguinte transcrição de um texto de comédia portuguesa.\n"
-            f"--- TRANSCRIÇÃO ---\n{full_transcript}\n--------------------\n\n"
+            f"--- TRANSCRIÇÃO ---\n{script}\n--------------------\n\n"
             "Escreve um breve resumo (5 frases no máximo) que descreva a premissa principal, "
             "o cenário e a dinâmica deste texto.\n"
             "Responde estritamente em Português de Portugal.\n\n"
@@ -210,15 +330,27 @@ class TrainingDataFormatter:
             f'Vais escrever um sketch de comédia portuguesa completo com a seguinte premissa:\n"{premise}"\n\n'
             f"{reference_note}"
             "Antes de escreveres o sketch, planeia em voz alta, na primeira pessoa e no FUTURO, "
-            "o arco cómico COMPLETO.\n\n"
-            "Para CADA piada da escalada, indica explicitamente:\n"
-            "  (a) que expectativa a montagem cria no espectador;\n"
-            "  (b) que elemento viola essa expectativa;\n"
-            "  (c) que lógica interna torna a violação dessa expectativa compreensível em vez de arbitrária.\n\n"
-            "Indica também como cada piada eleva a aposta da anterior e porque é que a "
-            "punchline final é o ponto de maior distância entre expectativa e desfecho.\n"
-            "NÃO expliques piadas isoladas -- sintetiza tudo num ÚNICO plano coeso.\n"
-            "Sê estruturado mas conciso (máximo 15 frases).\n\n"
+            "o arco cómico COMPLETO. Segue esta estrutura:\n\n"
+            "1. ELENCO\n"
+            "   Para cada personagem, indica um nome curto ou papel e uma "
+            "característica de voz que a distinga das outras (registo, tique verbal, "
+            "obsessão). Mantém esse elenco fixo durante todo o plano.\n\n"
+            "2. ABORDAGEM REJEITADA\n"
+            "   Considera brevemente uma abordagem óbvia para esta premissa e "
+            "explica em uma ou duas frases por que a vais rejeitar por ser previsível "
+            "ou por cair em clichê.\n\n"
+            "3. ARCO CÓMICO\n"
+            "   Descreve a abordagem que vais efectivamente usar e como abres a cena. "
+            "Depois, para CADA piada da escalada, escreve pelo menos três frases:\n"
+            "     (a) uma frase que descreva a expectativa concreta que a montagem cria no espectador;\n"
+            "     (b) uma frase que descreva o elemento específico que viola essa expectativa;\n"
+            "     (c) uma frase que explique a lógica interna que torna a violação compreensível em vez de arbitrária.\n\n"
+            "4. ESCALADA E PUNCHLINE\n"
+            "   Explica como cada piada eleva a aposta da anterior e porque é que a "
+            "punchline final é o ponto de maior distância entre expectativa e desfecho.\n\n"
+            "REGRAS:\n"
+            "- NÃO expliques piadas isoladas fora deste plano, sintetiza tudo num ÚNICO plano coeso.\n"
+            "- Sê estruturado. Extensão alvo: entre 25 e 30 frases.\n\n"
             "FORMATO OBRIGATÓRIO:\nPLANO: [o teu plano aqui]"
         )
 
@@ -235,7 +367,7 @@ class TrainingDataFormatter:
             outputs = self.llm_pipeline(
                 messages,
                 temperature=0.7,
-                max_new_tokens=2048,
+                max_new_tokens=3500,
                 do_sample=True,
                 continue_final_message=True,
             )
@@ -248,7 +380,7 @@ class TrainingDataFormatter:
             logger.warning(f"LLM arc reasoning synthesis failed: {e}. Reverting to fallback.")
             return fallback_reasoning
 
-    def format_for_lora(self, sketch_id: str, data: list, lora_file) -> int:
+    def format_for_lora(self, sketch_id: str, data: list, enriched_script: str, lora_file) -> int:
         punchline_beats = []
         for line in data:
             if line.get("is_punchline", False):
@@ -256,15 +388,13 @@ class TrainingDataFormatter:
                 if analysis and "Local LLM Error" not in analysis:
                     punchline_beats.append((line.get("speaker", "UNKNOWN"), line.get("text", ""), analysis))
 
-        full_transcript = "\n".join([f"[{line.get('speaker', 'UNKNOWN')}]: {line.get('text', '')}" for line in data])
-
         variants = 1 if self.dry_run else self.variants
         macro_count = 0
 
         for _ in range(variants):
-            summary_input = self._generate_synthetic_summary(sketch_id, data)
+            summary_input = self._generate_synthetic_summary(sketch_id, enriched_script)
             reasoning = self._generate_synthetic_arc_reasoning(sketch_id, summary_input, punchline_beats)
-            macro_output = f"<think>\n{reasoning}\n</think>\n\n{full_transcript}"
+            macro_output = f"<think>\n{reasoning}\n</think>\n\n{enriched_script}"
 
             lora_entry = {
                 "task": "macro",
@@ -288,9 +418,12 @@ class TrainingDataFormatter:
             logger.error(f"Failed to parse {filepath.name}. Skipping.")
             return False, 0
 
+        transcript = self._render_script(data)
+        enriched_script = self._generate_script(sketch_id, transcript)
+
         with open(self.lora_output_file, "a", encoding="utf-8") as lora_f:
-            macro_count = self.format_for_lora(sketch_id, data, lora_f)
-        self.format_for_rag(sketch_id, data)
+            macro_count = self.format_for_lora(sketch_id, data, enriched_script, lora_f)
+        self.format_for_rag(sketch_id, enriched_script, data)
 
         return True, macro_count
 
@@ -304,6 +437,7 @@ if __name__ == "__main__":
         default=1,
         help="Number of diverse full-sketch training examples to generate per sketch.",
     )
+    parser.add_argument("--limit", type=int, default=None, help="Process at most N sketches this run (testing).")
     args = parser.parse_args()
 
     base_dir = Path(__file__).resolve().parent.parent.parent / "data"
@@ -315,18 +449,36 @@ if __name__ == "__main__":
     rag_output_dir.mkdir(parents=True, exist_ok=True)
     lora_output_dir.mkdir(parents=True, exist_ok=True)
 
+    catalog_path = base_dir / "01_catalogs" / "luso_laugh_catalog.csv"
+    if not catalog_path.exists():
+        logger.error(f"Catalog file '{catalog_path}' not found. Cannot filter scripts.")
+        exit(1)
+
+    df_catalog = pd.read_csv(catalog_path)
+    valid_sketch_ids = set(df_catalog["sketch_id"].astype(str))
+
     input_files = list(input_dir.glob("*_annotated.json"))
     processed_ids = {f.stem.replace("_rag", "") for f in rag_output_dir.glob("*_rag.json")}
-    pending_files = [f for f in input_files if f.stem.replace("_annotated", "") not in processed_ids]
+    pending_files = [
+        f
+        for f in input_files
+        if f.stem.replace("_annotated", "") in valid_sketch_ids
+        and f.stem.replace("_annotated", "") not in processed_ids
+    ]
 
     logger.info("=" * 45)
     logger.info("LUSO-LAUGH TRANSFORM PIPELINE STATUS")
     logger.info("=" * 45)
+    logger.info(f"Total valid annotated sketches:    {len(valid_sketch_ids)}")
     logger.info(f"Total annotated sketches:    {len(input_files)}")
     logger.info(f"Already transformed:         {len(processed_ids)}")
     logger.info(f"To process this run:         {len(pending_files)}")
     logger.info(f"Variants per sketch:         {args.macro_variants}")
     logger.info("=" * 45)
+
+    if args.limit:
+        pending_files = pending_files[: args.limit]
+        logger.info(f"Limiting this run to {len(pending_files)} sketches.")
 
     if not pending_files:
         logger.info("No sketches pending transformation. Exiting.")
