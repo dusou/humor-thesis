@@ -5,9 +5,13 @@ import logging
 import os
 from pathlib import Path
 import re
+import sys
 import torch
 import transformers
 from transformers import (
+    LogitsProcessor,
+    LogitsProcessorList,
+    set_seed,
     StoppingCriteria,
     StoppingCriteriaList,
 )
@@ -26,7 +30,18 @@ os.environ["HF_HUB_DISABLE_TELEMETRY"] = "1"
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 
+data_process_dir = (Path(__file__).resolve().parent.parent / "02_data_process").resolve()
+if str(data_process_dir) not in sys.path:
+    sys.path.insert(0, str(data_process_dir))
+
+from D_data_transform import MACRO_INSTRUCTION, SYSTEM_PROMPT
+
+
 class ThinkCloseStoppingCriteria(StoppingCriteria):
+    """
+    Thinking Block stopping criteria
+    """
+
     def __init__(self, tokenizer, prompt_len):
         self.tokenizer = tokenizer
         self.prompt_len = prompt_len
@@ -35,6 +50,24 @@ class ThinkCloseStoppingCriteria(StoppingCriteria):
         tail_ids = input_ids[0, self.prompt_len :]
         tail_text = self.tokenizer.decode(tail_ids[-8:], skip_special_tokens=False)
         return "</think>" in tail_text
+
+
+class RepetitionControlProcessor(LogitsProcessor):
+    """Presence is flat; frequency scales with count and is what breaks a
+    running loop. Cap keeps common function words usable in long generations."""
+
+    def __init__(self, presence, frequency, prompt_len, max_freq=2.0):
+        self.presence, self.frequency = presence, frequency
+        self.prompt_len, self.max_freq = prompt_len, max_freq
+
+    def __call__(self, input_ids, scores):
+        gen = input_ids[:, self.prompt_len :]
+        for i in range(scores.shape[0]):
+            if not gen[i].numel():
+                continue
+            toks, counts = torch.unique(gen[i], return_counts=True)
+            scores[i, toks] -= self.presence + torch.clamp(self.frequency * counts.to(scores.dtype), max=self.max_freq)
+        return scores
 
 
 class ComediaBaseline:
@@ -74,7 +107,7 @@ class ComediaBaseline:
             self.model = None
 
     def _generate_bounded(
-        self, messages: list, reasoning_budget: int = 3000, answer_budget: int = 3000
+        self, messages: list, reasoning_budget: int = 8000, answer_budget: int = 2500
     ) -> Tuple[str, str]:
         """
         Executes a two-phase generation process: capped reasoning followed by a guaranteed answer.
@@ -87,22 +120,22 @@ class ComediaBaseline:
         # Phase 1: Reasoning block generation
         try:
             with torch.inference_mode():
-                out_reasoning = self.model.generate(
+                prompt_len = inputs["input_ids"].shape[1]
+                out1 = self.model.generate(
                     **inputs,
                     max_new_tokens=reasoning_budget,
                     do_sample=True,
-                    temperature=0.7,
-                    repetition_penalty=1.05,
-                    top_p=0.9,
-                    stopping_criteria=StoppingCriteriaList(
-                        [ThinkCloseStoppingCriteria(self.tokenizer, inputs["input_ids"].shape[1])]
-                    ),
+                    temperature=1.0,
+                    top_p=0.95,
+                    top_k=20,
+                    min_p=0.0,
+                    repetition_penalty=1.0,
+                    logits_processor=LogitsProcessorList([RepetitionControlProcessor(1.0, 0.3, prompt_len)]),
+                    stopping_criteria=StoppingCriteriaList([ThinkCloseStoppingCriteria(self.tokenizer, prompt_len)]),
                 )
-            reasoning_text = self.tokenizer.decode(
-                out_reasoning[0, inputs["input_ids"].shape[1] :], skip_special_tokens=False
-            )
+            reasoning_text = self.tokenizer.decode(out1[0, inputs["input_ids"].shape[1] :], skip_special_tokens=False)
         finally:
-            del inputs, out_reasoning
+            del inputs
             gc.collect()
             torch.cuda.synchronize()
             torch.cuda.empty_cache()
@@ -117,19 +150,23 @@ class ComediaBaseline:
         inputs_answer = self.tokenizer(prompt + reasoning_text, return_tensors="pt").to(self.model.device)
         try:
             with torch.inference_mode():
-                out_answer = self.model.generate(
+                prompt_len = inputs_answer["input_ids"].shape[1]
+                out2 = self.model.generate(
                     **inputs_answer,
                     max_new_tokens=answer_budget,
                     do_sample=True,
-                    temperature=0.6,
-                    repetition_penalty=1.05,
-                    top_p=0.9,
+                    temperature=0.8,
+                    top_p=0.95,
+                    top_k=20,
+                    min_p=0.0,
+                    repetition_penalty=1.0,
+                    logits_processor=LogitsProcessorList([RepetitionControlProcessor(1.0, 0.3, prompt_len)]),
                 )
             answer_text = self.tokenizer.decode(
-                out_answer[0, inputs_answer["input_ids"].shape[1] :], skip_special_tokens=True
+                out2[0, inputs_answer["input_ids"].shape[1] :], skip_special_tokens=True
             )
         finally:
-            del inputs_answer, out_answer
+            del inputs_answer
             gc.collect()
             torch.cuda.synchronize()
             torch.cuda.empty_cache()
@@ -202,71 +239,29 @@ class ComediaBaseline:
         return re.sub(r"^(?:assistant\s*)+", "", cleaned.strip(), flags=re.IGNORECASE)
 
     def generate(self, query: str, format_type: str = "sketch") -> Dict:
-        """
-        Generates comedic text based on the provided query and format.
-        """
-        FORMAT_MAPPING = {
-            "sketch": {
-                "system_instruction": (
-                    "És um guionista profissional de comédia e sátira em Português de Portugal. "
-                    "O teu estilo é acutilante, irónico e subversivo, evitando o humor cliché ou 'seguro' da inteligência artificial. "
-                ),
-                "task_instruction": (
-                    "Escreve um sketch de comédia original para um vídeo (500 a 800 palavras) sobre o seguinte tema:\n'{query}'\n\n"
-                    "REGRAS OBRIGATÓRIAS:\n"
-                    "1. Usa ESTRITAMENTE Português de Portugal (PT-PT), incluindo vocabulário e expressões idiomáticas locais.\n"
-                    "2. Usa o formato de guião: [NOME DA PERSONAGEM] em maiúsculas antes das falas e didascálias (indicações cénicas) [entre parênteses retos].\n"
-                    "3. Usa o teu raciocínio para planear a ironia, a escalada do absurdo e as 'punchlines' antes de escreveres o guião final."
-                ),
-            },
-            "newspaper": {
-                "system_instruction": (
-                    "És um cronista satírico mordaz a escrever para um jornal português de renome. "
-                    "O teu tom é sarcástico e cheio de referências culturais locais."
-                ),
-                "task_instruction": (
-                    "Escreve um artigo de opinião humorístico e satírico (500 a 800 palavras) sobre o seguinte tema:\n'{query}'\n\n"
-                    "REGRAS OBRIGATÓRIAS:\n"
-                    "1. Usa ESTRITAMENTE Português de Portugal (PT-PT).\n"
-                    "2. Começa com um Título Satírico apelativo.\n"
-                    "3. Evita conclusões moralistas ou genéricas; mantém a ironia até à última frase.\n"
-                    "4. Usa o teu raciocínio para planear o ângulo crítico e os argumentos absurdos antes de escreveres o texto."
-                ),
-            },
-            "tv_show": {
-                "system_instruction": (
-                    "És o apresentador e guionista principal de um programa de televisão humorístico estilo 'late-night' em Portugal. "
-                    "O teu humor foca-se na atualidade, no exagero e em expor o absurdo da vida quotidiana e política."
-                ),
-                "task_instruction": (
-                    "Escreve o guião de um monólogo televisivo (500 a 800 palavras) que relata eventos de forma cómica sobre o seguinte tema:\n'{query}'\n\n"
-                    "REGRAS OBRIGATÓRIAS:\n"
-                    "1. Usa ESTRITAMENTE Português de Portugal (PT-PT).\n"
-                    "2. Inclui marcadores de ritmo e interação com a plateia, como [Pausa para risos] ou [O público aplaude].\n"
-                    "3. Cria uma narrativa fluida que salte de uma observação absurda para a próxima.\n"
-                    "4. Usa o teu raciocínio para estruturar o ritmo antes de iniciares o monólogo."
-                ),
-            },
-        }
-
-        instructions = FORMAT_MAPPING.get(format_type, FORMAT_MAPPING["sketch"])
-
         if self.dry_run:
             return {"text": f"[DRY RUN] Generated mock {format_type} output.", "sources": []}
 
         try:
             messages = [
-                {"role": "system", "content": f"{instructions['system_instruction']}\n..."},
-                {"role": "user", "content": instructions["task_instruction"].format(query=query)},
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": f"{MACRO_INSTRUCTION}\n\n{query}"},
             ]
             reasoning, response = self._generate_bounded(messages)
-            clean_response = self._cleanup_pass(format_type, response)
-            print("===/ AFTER CLEANUP /====" + clean_response)
-            return {"text": clean_response, "sources": [], "reasoning": reasoning, "response_without_cleanup": response}
-
+            return {
+                "response": response,
+                "sources": [],
+                "reasoning": reasoning,
+                "response_with_cleanup": self._cleanup_pass(format_type, response),
+            }
         except Exception as e:
-            logger.error(f"Baseline generation failed for prompt: {query[:30]}... Reason: {e}")
-            return {"text": "ERROR: Generation failed.", "sources": []}
+            logger.error(f"Baseline generation failed: {e}")
+            return {
+                "response": "ERROR: Generation failed.",
+                "sources": [],
+                "reasoning": "ERROR: Generation failed.",
+                "response_with_cleanup": "ERROR: Generation failed.",
+            }
 
 
 if __name__ == "__main__":
@@ -292,6 +287,7 @@ if __name__ == "__main__":
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
     output_data = []
     total_items = len(prompts_list)
+    set_seed(42)
 
     for idx, item in enumerate(prompts_list, start=1):
         theme = item.get("theme", "general")
@@ -307,8 +303,9 @@ if __name__ == "__main__":
                 "theme": theme,
                 "format": format_type,
                 "prompt": prompt,
-                "reasoning": generation_result["reasoning"],
-                "output": generation_result["text"],
+                "reasoning": generation_result.get("reasoning", ""),
+                "clean_output": generation_result.get("response_with_cleanup", ""),
+                "output": generation_result["response"],
             }
         )
 

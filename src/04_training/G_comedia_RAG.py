@@ -8,9 +8,13 @@ import logging
 import os
 from pathlib import Path
 import re
+import sys
 import torch
 import transformers
 from transformers import (
+    LogitsProcessor,
+    LogitsProcessorList,
+    set_seed,
     StoppingCriteria,
     StoppingCriteriaList,
 )
@@ -28,8 +32,18 @@ transformers.logging.set_verbosity_error()
 os.environ["HF_HUB_DISABLE_TELEMETRY"] = "1"
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
+data_process_dir = (Path(__file__).resolve().parent.parent / "02_data_process").resolve()
+if str(data_process_dir) not in sys.path:
+    sys.path.insert(0, str(data_process_dir))
+
+from D_data_transform import MACRO_INSTRUCTION, SYSTEM_PROMPT
+
 
 class ThinkCloseStoppingCriteria(StoppingCriteria):
+    """
+    Thinking Block stopping criteria
+    """
+
     def __init__(self, tokenizer, prompt_len):
         self.tokenizer = tokenizer
         self.prompt_len = prompt_len
@@ -38,6 +52,24 @@ class ThinkCloseStoppingCriteria(StoppingCriteria):
         tail_ids = input_ids[0, self.prompt_len :]
         tail_text = self.tokenizer.decode(tail_ids[-8:], skip_special_tokens=False)
         return "</think>" in tail_text
+
+
+class RepetitionControlProcessor(LogitsProcessor):
+    """Presence is flat; frequency scales with count and is what breaks a
+    running loop. Cap keeps common function words usable in long generations."""
+
+    def __init__(self, presence, frequency, prompt_len, max_freq=2.0):
+        self.presence, self.frequency = presence, frequency
+        self.prompt_len, self.max_freq = prompt_len, max_freq
+
+    def __call__(self, input_ids, scores):
+        gen = input_ids[:, self.prompt_len :]
+        for i in range(scores.shape[0]):
+            if not gen[i].numel():
+                continue
+            toks, counts = torch.unique(gen[i], return_counts=True)
+            scores[i, toks] -= self.presence + torch.clamp(self.frequency * counts.to(scores.dtype), max=self.max_freq)
+        return scores
 
 
 class ComediaRAG:
@@ -134,7 +166,7 @@ class ComediaRAG:
             logger.error(f"Failed to load Generative LLM: {e}")
             self.model = None
 
-    def _generate_bounded(self, messages, reasoning_budget=2000, answer_budget=2000):
+    def _generate_bounded(self, messages, reasoning_budget=5000, answer_budget=2500):
         """Two bounded phases: capped reasoning, then a guaranteed answer budget."""
         prompt = self.tokenizer.apply_chat_template(
             messages, tokenize=False, add_generation_prompt=True, enable_thinking=True
@@ -143,16 +175,18 @@ class ComediaRAG:
 
         try:  # Phase 1 : reason
             with torch.inference_mode():
+                prompt_len = inputs["input_ids"].shape[1]
                 out1 = self.model.generate(
                     **inputs,
                     max_new_tokens=reasoning_budget,
                     do_sample=True,
-                    temperature=0.7,
-                    repetition_penalty=1.05,
-                    top_p=0.9,
-                    stopping_criteria=StoppingCriteriaList(
-                        [ThinkCloseStoppingCriteria(self.tokenizer, inputs["input_ids"].shape[1])]
-                    ),
+                    temperature=1.0,
+                    top_p=0.95,
+                    top_k=20,
+                    min_p=0.0,
+                    repetition_penalty=1.0,
+                    logits_processor=LogitsProcessorList([RepetitionControlProcessor(1.0, 0.3, prompt_len)]),
+                    stopping_criteria=StoppingCriteriaList([ThinkCloseStoppingCriteria(self.tokenizer, prompt_len)]),
                 )
             reasoning_text = self.tokenizer.decode(out1[0, inputs["input_ids"].shape[1] :], skip_special_tokens=False)
         finally:  # Memory Cleanup
@@ -167,20 +201,26 @@ class ComediaRAG:
             logger.info("Reasoning hit its token budget. forcing closure.")
             reasoning_text = f"<think>{reasoning_text.split('<think>')[-1]}\n</think>\n\n"
 
-        inputs2 = self.tokenizer(prompt + reasoning_text, return_tensors="pt").to(self.model.device)
+        inputs_answer = self.tokenizer(prompt + reasoning_text, return_tensors="pt").to(self.model.device)
         try:  # Phase 2: answer
             with torch.inference_mode():
+                prompt_len = inputs_answer["input_ids"].shape[1]
                 out2 = self.model.generate(
-                    **inputs2,
+                    **inputs_answer,
                     max_new_tokens=answer_budget,
                     do_sample=True,
-                    temperature=0.6,
-                    repetition_penalty=1.05,
-                    top_p=0.9,
+                    temperature=0.8,
+                    top_p=0.95,
+                    top_k=20,
+                    min_p=0.0,
+                    repetition_penalty=1.0,
+                    logits_processor=LogitsProcessorList([RepetitionControlProcessor(1.0, 0.3, prompt_len)]),
                 )
-            answer_text = self.tokenizer.decode(out2[0, inputs2["input_ids"].shape[1] :], skip_special_tokens=True)
+            answer_text = self.tokenizer.decode(
+                out2[0, inputs_answer["input_ids"].shape[1] :], skip_special_tokens=True
+            )
         finally:
-            del inputs2
+            del inputs_answer
             gc.collect()
             torch.cuda.synchronize()
             torch.cuda.empty_cache()
@@ -238,7 +278,7 @@ class ComediaRAG:
                     max_new_tokens=cleanup_budget,
                     do_sample=True,
                     temperature=0.3,
-                    repetition_penalty=1.1,
+                    repetition_penalty=1.05,
                     top_p=0.9,
                 )
             cleaned = self.tokenizer.decode(out[0, input_len:], skip_special_tokens=True)
@@ -251,25 +291,6 @@ class ComediaRAG:
         return re.sub(r"^(?:assistant\s*)+", "", cleaned.strip(), flags=re.IGNORECASE)
 
     def generate(self, query: str, format_type: str = "sketch") -> dict:
-        """Executes the RAG chain, dynamically injecting instructions and returning full context."""
-
-        FORMAT_MAPPING = {
-            "sketch": {
-                "system_instruction": "És um argumentista profissional de comédia e sátira portuguesa.",
-                "task_instruction": "escreve um novo sketch de comédia para um vídeo entre 500 a 800 palavras sobre o seguinte tema",
-            },
-            "newspaper": {
-                "system_instruction": "És um cronista satírico a escrever um artigo de opinião para um jornal português.",
-                "task_instruction": "escreve um texto de opinião humorístico e satírico com entre 500 a 8000 palavras sobre o seguinte tema",
-            },
-            "tv_show": {
-                "system_instruction": "És o guionista de um programa de televisão humorístico estilo 'late-night' sobre a atualidade portuguesa.",
-                "task_instruction": "escreve o guião de um monólogo televisivo de entre 500 a 800 palavras de duração que relata eventos reais de forma cómica sobre",
-            },
-        }
-
-        instructions = FORMAT_MAPPING.get(format_type, FORMAT_MAPPING["sketch"])
-
         if self.dry_run:
             return {"text": f"[DRY RUN] Generated mock {format_type} output.", "sources": []}
 
@@ -306,26 +327,25 @@ class ComediaRAG:
 
             if filtered:
                 messages = [
-                    {"role": "system", "content": f"{instructions['system_instruction']}\n..."},
+                    {"role": "system", "content": SYSTEM_PROMPT},
                     {
                         "role": "user",
-                        "content": f"{formatted_context}\n\nCom base na inspiração acima, {instructions['task_instruction']}: {query}",
+                        "content": (
+                            "Aqui estão sketches de referência para inspiração de ritmo, "
+                            f"cadência e registo:\n\n{formatted_context}\n\n"
+                            f"{MACRO_INSTRUCTION}\n\n{query}"
+                        ),
                     },
                 ]
             else:
                 messages = [
-                    {"role": "system", "content": f"{instructions['system_instruction']}\n..."},
-                    {
-                        "role": "user",
-                        "content": f"{instructions['task_instruction']}: {query}",
-                    },
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user", "content": f"{MACRO_INSTRUCTION}\n\n{query}"},
                 ]
                 logger.warning(f"No sufficiently relevant sketches found for query: {query[:60]}...")
 
             reasoning, response = self._generate_bounded(messages)
             clean_response = self._cleanup_pass(format_type, response)
-
-            print("===/ AFTER CLEANUP /====" + clean_response)
 
             return {
                 "text": clean_response,
@@ -367,6 +387,8 @@ if __name__ == "__main__":
     # batch processing loop
     output_data = []
     total_items = len(prompts_list)
+
+    set_seed(42)
 
     for idx, item in enumerate(prompts_list, start=1):
         theme = item.get("theme", "general")
