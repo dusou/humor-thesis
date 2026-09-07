@@ -166,7 +166,7 @@ class ComediaRAG:
             logger.error(f"Failed to load Generative LLM: {e}")
             self.model = None
 
-    def _generate_bounded(self, messages, reasoning_budget=5000, answer_budget=2500):
+    def _generate_bounded(self, messages, reasoning_budget=6000, answer_budget=2500):
         """Two bounded phases: capped reasoning, then a guaranteed answer budget."""
         prompt = self.tokenizer.apply_chat_template(
             messages, tokenize=False, add_generation_prompt=True, enable_thinking=True
@@ -190,7 +190,7 @@ class ComediaRAG:
                 )
             reasoning_text = self.tokenizer.decode(out1[0, inputs["input_ids"].shape[1] :], skip_special_tokens=False)
         finally:  # Memory Cleanup
-            del inputs
+            del inputs, out1
             gc.collect()
             torch.cuda.synchronize()
             torch.cuda.empty_cache()
@@ -296,7 +296,7 @@ class ComediaRAG:
 
         try:
             # explicitly retrieve the documents
-            docs_with_scores = self.vector_store.similarity_search_with_score(query, k=3)
+            docs_with_scores = self.vector_store.similarity_search_with_score(query, k=2)
 
             SCORE_THRESHOLD = 0.50
             filtered = [(doc, score) for doc, score in docs_with_scores if score <= SCORE_THRESHOLD]

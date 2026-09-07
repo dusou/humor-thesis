@@ -377,7 +377,7 @@ class ComediaLoRAGenerator:
             self.model = None
 
     def _generate_bounded(
-        self, messages: list, reasoning_budget: int = 5000, answer_budget: int = 2500
+        self, messages: list, reasoning_budget: int = 6000, answer_budget: int = 2500
     ) -> Tuple[str, str]:
         prompt = self.tokenizer.apply_chat_template(
             messages, tokenize=False, add_generation_prompt=True, enable_thinking=True

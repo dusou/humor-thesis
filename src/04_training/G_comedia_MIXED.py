@@ -9,10 +9,19 @@ import os
 from pathlib import Path
 from peft import PeftModel
 import re
+import sys
 import torch
 from tqdm import tqdm
 import transformers
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import (
+    AutoModelForCausalLM,
+    AutoTokenizer,
+    LogitsProcessor,
+    LogitsProcessorList,
+    set_seed,
+    StoppingCriteria,
+    StoppingCriteriaList,
+)
 from typing import Dict, Tuple
 
 logging.basicConfig(
@@ -25,6 +34,45 @@ logger = logging.getLogger(__name__)
 transformers.logging.set_verbosity_error()
 os.environ["HF_HUB_DISABLE_TELEMETRY"] = "1"
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+
+data_process_dir = (Path(__file__).resolve().parent.parent / "02_data_process").resolve()
+if str(data_process_dir) not in sys.path:
+    sys.path.insert(0, str(data_process_dir))
+
+from D_data_transform import MACRO_INSTRUCTION, SYSTEM_PROMPT
+
+
+class ThinkCloseStoppingCriteria(StoppingCriteria):
+    """
+    Thinking Block stopping criteria
+    """
+
+    def __init__(self, tokenizer, prompt_len):
+        self.tokenizer = tokenizer
+        self.prompt_len = prompt_len
+
+    def __call__(self, input_ids, scores, **kwargs):
+        tail_ids = input_ids[0, self.prompt_len :]
+        tail_text = self.tokenizer.decode(tail_ids[-8:], skip_special_tokens=False)
+        return "</think>" in tail_text
+
+
+class RepetitionControlProcessor(LogitsProcessor):
+    """Presence is flat; frequency scales with count and is what breaks a
+    running loop. Cap keeps common function words usable in long generations."""
+
+    def __init__(self, presence, frequency, prompt_len, max_freq=2.0):
+        self.presence, self.frequency = presence, frequency
+        self.prompt_len, self.max_freq = prompt_len, max_freq
+
+    def __call__(self, input_ids, scores):
+        gen = input_ids[:, self.prompt_len :]
+        for i in range(scores.shape[0]):
+            if not gen[i].numel():
+                continue
+            toks, counts = torch.unique(gen[i], return_counts=True)
+            scores[i, toks] -= self.presence + torch.clamp(self.frequency * counts.to(scores.dtype), max=self.max_freq)
+        return scores
 
 
 class ComediaHybridGenerator:
@@ -129,7 +177,7 @@ class ComediaHybridGenerator:
             self.model = None
 
     def _generate_bounded(
-        self, messages: list, reasoning_budget: int = 3000, answer_budget: int = 3000
+        self, messages: list, reasoning_budget: int = 6000, answer_budget: int = 2500
     ) -> Tuple[str, str]:
         """Capped reasoning block generation followed by a guaranteed answer generation."""
         prompt = self.tokenizer.apply_chat_template(
@@ -139,13 +187,18 @@ class ComediaHybridGenerator:
 
         try:
             with torch.inference_mode():
+                prompt_len = inputs["input_ids"].shape[1]
                 out_reasoning = self.model.generate(
                     **inputs,
                     max_new_tokens=reasoning_budget,
                     do_sample=True,
-                    temperature=0.8,
-                    repetition_penalty=1.1,
-                    top_p=0.9,
+                    temperature=1.0,
+                    top_p=0.95,
+                    top_k=20,
+                    min_p=0.0,
+                    repetition_penalty=1.0,
+                    logits_processor=LogitsProcessorList([RepetitionControlProcessor(1.0, 0.3, prompt_len)]),
+                    stopping_criteria=StoppingCriteriaList([ThinkCloseStoppingCriteria(self.tokenizer, prompt_len)]),
                 )
             reasoning_text = self.tokenizer.decode(
                 out_reasoning[0, inputs["input_ids"].shape[1] :], skip_special_tokens=False
@@ -166,13 +219,17 @@ class ComediaHybridGenerator:
 
         try:
             with torch.inference_mode():
+                prompt_len = inputs_answer["input_ids"].shape[1]
                 out_answer = self.model.generate(
                     **inputs_answer,
                     max_new_tokens=answer_budget,
                     do_sample=True,
                     temperature=0.8,
-                    repetition_penalty=1.1,
-                    top_p=0.9,
+                    top_p=0.95,
+                    top_k=20,
+                    min_p=0.0,
+                    repetition_penalty=1.0,
+                    logits_processor=LogitsProcessorList([RepetitionControlProcessor(1.0, 0.3, prompt_len)]),
                 )
             answer_text = self.tokenizer.decode(
                 out_answer[0, inputs_answer["input_ids"].shape[1] :], skip_special_tokens=True
@@ -187,33 +244,74 @@ class ComediaHybridGenerator:
         clean_answer = re.sub(r"</?think>", "", clean_answer)
         clean_answer = re.sub(r"^(?:assistant\s*)+", "", clean_answer.strip(), flags=re.IGNORECASE)
 
-        return reasoning_text, clean_answer.strip()
+        clean_reasoning = re.sub(r"</?think>", "", reasoning_text).strip()
+        return clean_reasoning, clean_answer.strip()
+
+    def _cleanup_pass(self, format_type: str, raw_text: str) -> str:
+        cleanup_prompt = f"""
+                        Abaixo está um rascunho de um texto de comédia portuguesa (formato: {format_type})
+                        gerado automaticamente, que pode conter alguns tipos de problemas como:
+                        1. Repetição de falas ou frases no final do texto (ficou "preso" a repetir a mesma linha).
+                        2. Pequenos erros de formatação, como tags de personagem malformadas (ex: "[SPEAKER_00>" em vez de "[SPEAKER_00]").
+                        3. Personagens não existentes no sketch podem surgir subitamente entre parentesis retos.
+                        4. Palavras que podem aparecer em Português do Brasil em vez de Português Europeu.
+
+                        --- RASCUNHO ---
+                        {raw_text}
+                        --- FIM DO RASCUNHO ---
+
+                        Tarefa: devolve o texto corrigido, removendo quaisquer repetições do final e corrigindo
+                        erros de formatação. Se o texto tiver sido cortado a meio de uma repetição, termina-o de
+                        forma muito breve e natural (no máximo 2 a 3 falas adicionais).
+
+                        IMPORTANTE:
+                        - Não alteres o conteúdo, o enredo ou o estilo do resto do texto a não ser que seja necessário para resolver os problemas acima.
+                        - Não acrescentes novas personagens ou temas.
+                        - Devolve apenas o texto corrigido, sem comentários, notas ou explicações.
+                        - Usa Português Europeu.
+                        """
+        messages = [
+            {
+                "role": "system",
+                "content": "És um editor de guiões de comédia portuguesa. A tua única tarefa é corrigir repetições e erros de formatação, mantendo tudo o resto inalterado.",
+            },
+            {"role": "user", "content": cleanup_prompt},
+        ]
+        prompt = self.tokenizer.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True, enable_thinking=False
+        )
+        inputs = self.tokenizer(prompt, return_tensors="pt").to(self.model.device)
+        input_len = inputs["input_ids"].shape[1]
+        cleanup_budget = min(input_len + 50, 3500)
+
+        try:
+            with self.model.disable_adapter():
+                with torch.inference_mode():
+                    out = self.model.generate(
+                        **inputs,
+                        max_new_tokens=cleanup_budget,
+                        do_sample=True,
+                        temperature=0.3,
+                        repetition_penalty=1.05,
+                        top_p=0.9,
+                    )
+                cleaned = self.tokenizer.decode(out[0, input_len:], skip_special_tokens=True)
+        finally:
+            del inputs
+            gc.collect()
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
+
+        return re.sub(r"^(?:assistant\s*)+", "", cleaned.strip(), flags=re.IGNORECASE)
 
     def generate(self, query: str, format_type: str = "sketch") -> Dict:
         """Executes the Hybrid pipeline: Context retrieval + LoRA stylized generation."""
-        format_mapping = {
-            "sketch": {
-                "system_instruction": "És um argumentista profissional de comédia e sátira portuguesa.",
-                "task_instruction": "escreve um novo sketch de comédia para um vídeo entre 2 e 5 minutos sobre o seguinte tema",
-            },
-            "newspaper": {
-                "system_instruction": "És um cronista satírico a escrever um artigo de opinião para um jornal português.",
-                "task_instruction": "escreve um texto de opinião humorístico e satírico com entre 5 a 12 parágrafos sobre o seguinte tema",
-            },
-            "tv_show": {
-                "system_instruction": "És o guionista de um programa de televisão humorístico estilo 'late-night' sobre a atualidade portuguesa.",
-                "task_instruction": "escreve o guião de um monólogo televisivo de entre 2 a 5 minutos de duração que relata eventos reais de forma cómica sobre",
-            },
-        }
-
-        instructions = format_mapping.get(format_type, format_mapping["sketch"])
-
         if self.dry_run or not self.model:
             return {"text": f"[DRY RUN] Generated mock {format_type} output.", "sources": []}
 
         try:
             # RAG Retrieval Layer
-            docs_with_scores = self.vector_store.similarity_search_with_score(query, k=3)
+            docs_with_scores = self.vector_store.similarity_search_with_score(query, k=2)
             SCORE_THRESHOLD = 0.50
             filtered = [(doc, score) for doc, score in docs_with_scores if score <= SCORE_THRESHOLD]
 
@@ -227,7 +325,6 @@ class ComediaHybridGenerator:
                 retrieved_contexts.append({"sketch_id": s_id, "text": s_text})
 
             docs = [doc for doc, _ in filtered]
-
             formatted_context = ""
             for i, doc in enumerate(docs, 1):
                 if len(formatted_context) + len(doc.metadata["sketch_id"]) > 15000:
@@ -239,32 +336,52 @@ class ComediaHybridGenerator:
 
             if filtered:
                 messages = [
-                    {"role": "system", "content": f"{instructions['system_instruction']}\n..."},
+                    {"role": "system", "content": SYSTEM_PROMPT},
                     {
                         "role": "user",
-                        "content": f"{formatted_context}\n\nCom base na inspiração acima, {instructions['task_instruction']}: {query}",
+                        "content": (
+                            "Aqui estão sketches de referência para inspiração de ritmo, "
+                            f"cadência e registo:\n\n{formatted_context}\n\n"
+                            f"{MACRO_INSTRUCTION}\n\n{query}"
+                        ),
                     },
                 ]
             else:
                 messages = [
-                    {"role": "system", "content": f"{instructions['system_instruction']}\n..."},
-                    {"role": "user", "content": f"{instructions['task_instruction']}: {query}"},
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user", "content": f"{MACRO_INSTRUCTION}\n\n{query}"},
                 ]
                 logger.warning(f"No sufficiently relevant sketches found for query: {query[:60]}...")
 
             # LoRA Generation Layer
-            reasoning, clean_response = self._generate_bounded(messages)
-            return {"text": clean_response, "sources": retrieved_contexts, "reasoning": reasoning}
+            reasoning, response = self._generate_bounded(messages)
+            clean_response = self._cleanup_pass(format_type, response)
+
+            return {
+                "response": response,
+                "sources": retrieved_contexts,
+                "reasoning": reasoning,
+                "response_with_cleanup": clean_response,
+            }
 
         except Exception as e:
             logger.error(f"Generation failed: {e}")
-            return {"text": "ERROR: Generation failed.", "sources": []}
+            return {
+                "response": "ERROR: Generation failed.",
+                "sources": [],
+                "reasoning": "ERROR: Generation failed.",
+                "response_with_cleanup": "ERROR: Generation failed.",
+            }
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="ComedIA Hybrid (RAG + LoRA) Generator")
     parser.add_argument(
-        "--rank", type=int, default=16, choices=[8, 16, 64], help="LoRA rank dimension to load the respective adapter."
+        "--rank",
+        type=int,
+        default=16,
+        choices=[4, 8, 16, 32, 64],
+        help="LoRA rank dimension to load the respective adapter.",
     )
     parser.add_argument("--dry-run", action="store_true", help="Run without loading Qwen model")
     args = parser.parse_args()
@@ -291,6 +408,8 @@ if __name__ == "__main__":
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_data = []
 
+    set_seed(42)
+
     for item in tqdm(prompts_list, desc=f"Generating Hybrid (r={args.rank})", unit="prompt"):
         theme = item.get("theme", "general")
         format_type = item.get("format", "sketch")
@@ -305,11 +424,12 @@ if __name__ == "__main__":
                 "prompt": prompt,
                 "retrieved_context": generation_result["sources"],
                 "reasoning": generation_result.get("reasoning", ""),
-                "output": generation_result["text"],
+                "clean_output": generation_result.get("response_with_cleanup", ""),
+                "output": generation_result.get("response", ""),
             }
         )
 
     with open(output_path, "w", encoding="utf-8") as f:
         json.dump(output_data, f, ensure_ascii=False, indent=4)
 
-    logger.info(f"Hybrid generation complete! Results saved to {output_path.name}")
+    logger.info(f"Hybrid generation complete. Results saved to {output_path.name}")
