@@ -207,7 +207,8 @@ class ComediaRAG:
             torch.cuda.synchronize()
             torch.cuda.empty_cache()
 
-        logger.warning(f"Reasoning did not close within {reasoning_budget} tokens.")
+        if "</think>" not in reasoning_text:
+            logger.warning(f"Reasoning did not close within {reasoning_budget} tokens.")
         reasoning_text = self._normalise_reasoning(reasoning_text)
 
         inputs_answer = self.tokenizer(prompt + reasoning_text, return_tensors="pt").to(self.model.device)

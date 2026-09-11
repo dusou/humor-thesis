@@ -176,19 +176,19 @@ class ComediaHybridGenerator:
             logger.error(f"Initialization failed: {e}")
             self.model = None
 
-        @staticmethod
-        def _normalise_reasoning(reasoning_text: str, trim_incomplete: bool = True) -> str:
-            closed = "</think>" in reasoning_text
+    @staticmethod
+    def _normalise_reasoning(reasoning_text: str, trim_incomplete: bool = True) -> str:
+        closed = "</think>" in reasoning_text
 
-            body = reasoning_text.split("</think>")[0]
-            body = re.sub(r"</?think>", "", body).strip()
+        body = reasoning_text.split("</think>")[0]
+        body = re.sub(r"</?think>", "", body).strip()
 
-            if not closed and trim_incomplete:
-                cut = max(body.rfind(". "), body.rfind(".\n"), body.rfind("! "), body.rfind("? "))
-                if cut > 200:
-                    body = body[: cut + 1]
+        if not closed and trim_incomplete:
+            cut = max(body.rfind(". "), body.rfind(".\n"), body.rfind("! "), body.rfind("? "))
+            if cut > 200:
+                body = body[: cut + 1]
 
-            return f"<think>\n{body}\n</think>\n\n"
+        return f"<think>\n{body}\n</think>\n\n"
 
     def _generate_bounded(
         self, messages: list, reasoning_budget: int = 6000, answer_budget: int = 2500
@@ -223,7 +223,8 @@ class ComediaHybridGenerator:
             torch.cuda.synchronize()
             torch.cuda.empty_cache()
 
-        logger.warning(f"Reasoning did not close within {reasoning_budget} tokens.")
+        if "</think>" not in reasoning_text:
+            logger.warning(f"Reasoning did not close within {reasoning_budget} tokens.")
         reasoning_text = self._normalise_reasoning(reasoning_text)
 
         inputs_answer = self.tokenizer(prompt + reasoning_text, return_tensors="pt").to(self.model.device)
