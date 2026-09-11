@@ -58,7 +58,7 @@ class RepetitionControlProcessor(LogitsProcessor):
     """Presence is flat; frequency scales with count and is what breaks a
     running loop. Cap keeps common function words usable in long generations."""
 
-    def __init__(self, presence, frequency, prompt_len, max_freq=2.0):
+    def __init__(self, presence, frequency, prompt_len, max_freq=4.0):
         self.presence, self.frequency = presence, frequency
         self.prompt_len, self.max_freq = prompt_len, max_freq
 
@@ -146,6 +146,20 @@ class ComediaRAG:
             encode_kwargs={"normalize_embeddings": True},
         )
 
+    @staticmethod
+    def _normalise_reasoning(reasoning_text: str, trim_incomplete: bool = True) -> str:
+        closed = "</think>" in reasoning_text
+
+        body = reasoning_text.split("</think>")[0]
+        body = re.sub(r"</?think>", "", body).strip()
+
+        if not closed and trim_incomplete:
+            cut = max(body.rfind(". "), body.rfind(".\n"), body.rfind("! "), body.rfind("? "))
+            if cut > 200:
+                body = body[: cut + 1]
+
+        return f"<think>\n{body}\n</think>\n\n"
+
     def _init_chain(self, llm_model_name: str):
         """Initializes Qwen-3.5-9B and constructs a decoupled LCEL chain."""
         if self.dry_run:
@@ -166,7 +180,7 @@ class ComediaRAG:
             logger.error(f"Failed to load Generative LLM: {e}")
             self.model = None
 
-    def _generate_bounded(self, messages, reasoning_budget=6000, answer_budget=2500):
+    def _generate_bounded(self, messages, reasoning_budget=5500, answer_budget=2500):
         """Two bounded phases: capped reasoning, then a guaranteed answer budget."""
         prompt = self.tokenizer.apply_chat_template(
             messages, tokenize=False, add_generation_prompt=True, enable_thinking=True
@@ -183,9 +197,7 @@ class ComediaRAG:
                     temperature=1.0,
                     top_p=0.95,
                     top_k=20,
-                    min_p=0.0,
-                    repetition_penalty=1.0,
-                    logits_processor=LogitsProcessorList([RepetitionControlProcessor(1.0, 0.3, prompt_len)]),
+                    logits_processor=LogitsProcessorList([RepetitionControlProcessor(1.1, 0.3, prompt_len)]),
                     stopping_criteria=StoppingCriteriaList([ThinkCloseStoppingCriteria(self.tokenizer, prompt_len)]),
                 )
             reasoning_text = self.tokenizer.decode(out1[0, inputs["input_ids"].shape[1] :], skip_special_tokens=False)
@@ -195,11 +207,8 @@ class ComediaRAG:
             torch.cuda.synchronize()
             torch.cuda.empty_cache()
 
-        if "</think>" in reasoning_text:
-            reasoning_text = reasoning_text.split("</think>")[0] + "</think>\n\n"
-        else:
-            logger.info("Reasoning hit its token budget. forcing closure.")
-            reasoning_text = f"<think>{reasoning_text.split('<think>')[-1]}\n</think>\n\n"
+        logger.warning(f"Reasoning did not close within {reasoning_budget} tokens.")
+        reasoning_text = self._normalise_reasoning(reasoning_text)
 
         inputs_answer = self.tokenizer(prompt + reasoning_text, return_tensors="pt").to(self.model.device)
         try:  # Phase 2: answer
@@ -212,9 +221,7 @@ class ComediaRAG:
                     temperature=0.8,
                     top_p=0.95,
                     top_k=20,
-                    min_p=0.0,
-                    repetition_penalty=1.0,
-                    logits_processor=LogitsProcessorList([RepetitionControlProcessor(1.0, 0.3, prompt_len)]),
+                    logits_processor=LogitsProcessorList([RepetitionControlProcessor(1.1, 0.3, prompt_len)]),
                 )
             answer_text = self.tokenizer.decode(
                 out2[0, inputs_answer["input_ids"].shape[1] :], skip_special_tokens=True

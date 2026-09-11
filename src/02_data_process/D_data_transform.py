@@ -46,10 +46,12 @@ SYSTEM_PROMPT = (
 MACRO_INSTRUCTION = (
     "Escreve um sketch de comédia original em Português de Portugal a partir do "
     "tema e premissa indicados no fim.\n\n"
-    "Antes de escreveres, planeia o arco cómico completo seguindo a estrutura: "
-    "ELENCO, ABORDAGEM REJEITADA, ARCO CÓMICO (com expectativa, violação e "
-    "lógica interna para cada piada) e ESCALADA. Extensão do plano: 25 a 30 frases.\n\n"
-    "Regras de escrita:\n"
+    "Antes de escreveres, planeia o arco cómico completo no teu raciocínio interno "
+    "seguindo a estrutura: ELENCO, ABORDAGEM REJEITADA, ARCO CÓMICO (com expectativa, "
+    "violação e lógica interna para cada piada) e ESCALADA.\n\n"
+    "IMPORTANTE: o plano é apenas para teu uso interno. A tua resposta final deve "
+    "conter APENAS o guião em falas, sem plano, sem títulos de secção, sem ELENCO, "
+    "sem comentários.\n\nRegras de escrita:\n"
     "1. Escreve o guião em falas. Cada fala ocupa uma linha própria, precedida "
     "pelo nome da personagem em maiúsculas entre parênteses retos: [NOME]: fala.\n"
     "2. Podes acrescentar didascálias breves em linha própria, entre parênteses "
@@ -268,8 +270,11 @@ class TrainingDataFormatter:
         prompt = (
             "Lê a seguinte transcrição de um texto de comédia portuguesa.\n"
             f"--- TRANSCRIÇÃO ---\n{script}\n--------------------\n\n"
-            "Escreve um breve resumo (5 frases no máximo) que descreva a premissa principal, "
-            "o cenário e a dinâmica deste texto.\n"
+            "Escreve um resumo muito breve (máximo 35 palavras) que descreva a "
+            "premissa principal e o cenário deste texto.\n"
+            "Não reveles a punchline, o desfecho, nem onde está a piada."
+            "Descreve apenas o ponto de partida, como faria alguém a encomendar "
+            "um sketch sobre este tema.\n"
             "Responde estritamente em Português de Portugal.\n\n"
             "FORMATO OBRIGATÓRIO:\nRESUMO: [O teu resumo aqui]"
         )
@@ -300,7 +305,9 @@ class TrainingDataFormatter:
             logger.warning(f"LLM summarization failed: {e}. Reverting to fallback summary.")
             return fallback_summary
 
-    def _generate_synthetic_arc_reasoning(self, sketch_id: str, premise: str, punchline_beats: list) -> str:
+    def _generate_synthetic_arc_reasoning(
+        self, sketch_id: str, premise: str, script: str, punchline_beats: list
+    ) -> str:
         fallback_reasoning = (
             f"Vou escrever um sketch original com a seguinte premissa: {premise} "
             "Vou estruturar o texto com uma escalada gradual de absurdo, encadeando várias piadas até à punchline final."
@@ -327,30 +334,36 @@ class TrainingDataFormatter:
             )
 
         prompt = (
-            f'Vais escrever um sketch de comédia portuguesa completo com a seguinte premissa:\n"{premise}"\n\n'
+            f'Imagina que vais escrever um sketch de comédia portuguesa completo a partir desta premissa curta:\n"{premise}"\n\n'
+            "Para te orientares, aqui está um sketch que parte desta mesma premissa:\n"
+            f"--- SKETCH DE REFERÊNCIA ---\n{script}\n--- FIM ---\n\n"
             f"{reference_note}"
-            "Antes de escreveres o sketch, planeia em voz alta, na primeira pessoa e no FUTURO, "
-            "o arco cómico COMPLETO. Segue esta estrutura:\n\n"
+            "Escreve o plano que levaria alguém a produzir um sketch como este, "
+            "partindo APENAS da premissa curta acima. Escreve na primeira pessoa e no "
+            "FUTURO, como se ainda não tivesses escrito nada.\n\n"
+            "CRÍTICO: o plano tem de ser auto-suficiente. Quem o ler, sem ver o sketch "
+            "de referência, tem de conseguir escrever o sketch inteiro só com o plano. "
+            "Inclui portanto no plano todos os elementos concretos necessários: nomes "
+            "das personagens, cenário, e o conteúdo específico de cada piada.\n\n"
+            "Segue esta estrutura:\n\n"
             "1. ELENCO\n"
-            "   Para cada personagem, indica um nome curto ou papel e uma "
-            "característica de voz que a distinga das outras (registo, tique verbal, "
-            "obsessão). Mantém esse elenco fixo durante todo o plano.\n\n"
+            "   Para cada personagem, indica o nome e uma característica de voz que a "
+            "distinga das outras (registo, tique verbal, obsessão).\n\n"
             "2. ABORDAGEM REJEITADA\n"
-            "   Considera brevemente uma abordagem óbvia para esta premissa e "
-            "explica em uma ou duas frases por que a vais rejeitar por ser previsível "
-            "ou por cair em clichê.\n\n"
+            "   Uma abordagem óbvia para esta premissa que vais rejeitar por previsível, "
+            "e porquê (uma ou duas frases).\n\n"
             "3. ARCO CÓMICO\n"
-            "   Descreve a abordagem que vais efectivamente usar e como abres a cena. "
-            "Depois, para CADA piada da escalada, escreve pelo menos três frases:\n"
-            "     (a) uma frase que descreva a expectativa concreta que a montagem cria no espectador;\n"
-            "     (b) uma frase que descreva o elemento específico que viola essa expectativa;\n"
-            "     (c) uma frase que explique a lógica interna que torna a violação compreensível em vez de arbitrária.\n\n"
+            "   Como abres a cena. Depois, para CADA piada da escalada, três frases:\n"
+            "     (a) a expectativa concreta que a montagem cria;\n"
+            "     (b) o elemento específico que a viola;\n"
+            "     (c) a lógica interna que torna a violação compreensível.\n\n"
             "4. ESCALADA E PUNCHLINE\n"
-            "   Explica como cada piada eleva a aposta da anterior e porque é que a "
-            "punchline final é o ponto de maior distância entre expectativa e desfecho.\n\n"
+            "   Como cada piada eleva a aposta da anterior, e porque é que a punchline "
+            "final é o ponto de maior distância entre expectativa e desfecho.\n\n"
             "REGRAS:\n"
-            "- NÃO expliques piadas isoladas fora deste plano, sintetiza tudo num ÚNICO plano coeso.\n"
-            "- Sê estruturado. Extensão alvo: entre 25 e 30 frases.\n\n"
+            "- NUNCA menciones o sketch de referência nem digas que ele existe.\n"
+            "- Não copies falas do sketch de referência para o plano.\n"
+            "- Sintetiza tudo num ÚNICO plano coeso. Extensão: 25 a 35 frases.\n\n"
             "FORMATO OBRIGATÓRIO:\nPLANO: [o teu plano aqui]"
         )
 
@@ -367,7 +380,7 @@ class TrainingDataFormatter:
             outputs = self.llm_pipeline(
                 messages,
                 temperature=0.7,
-                max_new_tokens=3500,
+                max_new_tokens=4500,
                 do_sample=True,
                 continue_final_message=True,
             )
@@ -393,7 +406,9 @@ class TrainingDataFormatter:
 
         for _ in range(variants):
             summary_input = self._generate_synthetic_summary(sketch_id, enriched_script)
-            reasoning = self._generate_synthetic_arc_reasoning(sketch_id, summary_input, punchline_beats)
+            reasoning = self._generate_synthetic_arc_reasoning(
+                sketch_id, summary_input, enriched_script, punchline_beats
+            )
             macro_output = f"<think>\n{reasoning}\n</think>\n\n{enriched_script}"
 
             lora_entry = {

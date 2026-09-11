@@ -5,7 +5,7 @@ import json
 import logging
 import os
 from pathlib import Path
-from peft import LoraConfig, PeftModel, prepare_model_for_kbit_training
+from peft import LoraConfig, PeftModel
 import re
 import sys
 import torch
@@ -14,7 +14,6 @@ import transformers
 from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
-    BitsAndBytesConfig,
     EarlyStoppingCallback,
     LogitsProcessor,
     LogitsProcessorList,
@@ -62,7 +61,7 @@ class RepetitionControlProcessor(LogitsProcessor):
     """Presence is flat; frequency scales with count and is what breaks a
     running loop. Cap keeps common function words usable in long generations."""
 
-    def __init__(self, presence, frequency, prompt_len, max_freq=2.0):
+    def __init__(self, presence, frequency, prompt_len, max_freq=4.0):
         self.presence, self.frequency = presence, frequency
         self.prompt_len, self.max_freq = prompt_len, max_freq
 
@@ -74,6 +73,31 @@ class RepetitionControlProcessor(LogitsProcessor):
             toks, counts = torch.unique(gen[i], return_counts=True)
             scores[i, toks] -= self.presence + torch.clamp(self.frequency * counts.to(scores.dtype), max=self.max_freq)
         return scores
+
+
+class MaskThinkCollator:
+    """Keeps the <think> block in the context but removes it from the loss."""
+
+    def __init__(self, base_collator, tokenizer):
+        self.base = base_collator
+        self.close_ids = torch.tensor(tokenizer.encode("</think>", add_special_tokens=False), dtype=torch.long)
+
+    def __call__(self, features):
+        batch = self.base(features)
+        ids, labels = batch["input_ids"], batch["labels"]
+        n = self.close_ids.numel()
+        close = self.close_ids.to(ids.device)
+
+        for i in range(ids.size(0)):
+            row = ids[i]
+            # Search backwards for the last </think>.
+            for j in range(row.size(0) - n, -1, -1):
+                if torch.equal(row[j : j + n], close):
+                    labels[i, : j + n] = -100
+                    break
+
+        batch["labels"] = labels
+        return batch
 
 
 class ComediaLoRATrainer:
@@ -132,74 +156,6 @@ class ComediaLoRATrainer:
         )
         return full_dataset.train_test_split(test_size=0.1, seed=42)
 
-    def evaluate_checkpoint(self, adapter_path: Path) -> dict:
-        """Eval loss on the split, with and without the adapter."""
-        if not adapter_path.exists():
-            logger.error(f"Adapter not found at {adapter_path}")
-            return {}
-
-        eval_data = self._load_split()["test"]
-        logger.info(f"Evaluating {adapter_path.name} on {len(eval_data)} held-out examples")
-
-        tokenizer = AutoTokenizer.from_pretrained(self.model_name, token=self.hf_token)
-        tokenizer.pad_token = tokenizer.eos_token
-        tokenizer.padding_side = "right"
-
-        bnb_config = BitsAndBytesConfig(
-            load_in_4bit=True,
-            bnb_4bit_use_double_quant=True,
-            bnb_4bit_quant_type="nf4",
-            bnb_4bit_compute_dtype=torch.bfloat16,
-        )
-        base_model = AutoModelForCausalLM.from_pretrained(
-            self.model_name,
-            quantization_config=bnb_config,
-            device_map="auto",
-            token=self.hf_token,
-            attn_implementation="sdpa",
-        )
-        model = PeftModel.from_pretrained(base_model, str(adapter_path))
-        model.eval()
-
-        args = SFTConfig(
-            output_dir=str(self.output_dir / "eval_tmp"),
-            per_device_eval_batch_size=4,
-            eval_accumulation_steps=1,
-            bf16=True,
-            max_length=4096,
-            assistant_only_loss=True,
-            report_to="none",
-        )
-        trainer = SFTTrainer(
-            model=model,
-            train_dataset=eval_data,  # unused
-            eval_dataset=eval_data,
-            processing_class=tokenizer,
-            args=args,
-        )
-
-        lora_metrics = trainer.evaluate(metric_key_prefix="lora")
-        with model.disable_adapter():
-            base_metrics = trainer.evaluate(metric_key_prefix="base")
-
-        lora_loss = lora_metrics["lora_loss"]
-        base_loss = base_metrics["base_loss"]
-        result = {
-            "adapter": adapter_path.name,
-            "base_loss": base_loss,
-            "lora_loss": lora_loss,
-            "delta": base_loss - lora_loss,
-            "base_ppl": float(torch.exp(torch.tensor(base_loss))),
-            "lora_ppl": float(torch.exp(torch.tensor(lora_loss))),
-            "base_token_acc": base_metrics.get("base_mean_token_accuracy"),
-            "lora_token_acc": lora_metrics.get("lora_mean_token_accuracy"),
-        }
-        logger.info(
-            f"base {base_loss:.4f} (ppl {result['base_ppl']:.2f})  ->  "
-            f"lora {lora_loss:.4f} (ppl {result['lora_ppl']:.2f})  |  Δ {result['delta']:+.4f}"
-        )
-        return result
-
     def train(self) -> None:
         if not self.dataset_path.exists():
             logger.error(f"Dataset not found at {self.dataset_path}")
@@ -216,23 +172,14 @@ class ComediaLoRATrainer:
         tokenizer.pad_token = tokenizer.eos_token
         tokenizer.padding_side = "right"
 
-        bnb_config = BitsAndBytesConfig(
-            load_in_4bit=True,
-            bnb_4bit_use_double_quant=True,
-            bnb_4bit_quant_type="nf4",
-            bnb_4bit_compute_dtype=torch.bfloat16,
-        )
-
-        logger.info("Loading base model in 4-bit precision...")
+        logger.info("Loading base model...")
         model = AutoModelForCausalLM.from_pretrained(
             self.model_name,
-            quantization_config=bnb_config,
             device_map="auto",
             token=self.hf_token,
             attn_implementation="sdpa",
         )
 
-        model = prepare_model_for_kbit_training(model)
         model.config.use_cache = False
 
         # Dynamic alpha scaling based on rank
@@ -264,8 +211,8 @@ class ComediaLoRATrainer:
 
         training_args = SFTConfig(
             output_dir=str(self.output_dir / f"checkpoints_r{self.rank}"),
-            per_device_train_batch_size=2,
-            gradient_accumulation_steps=4,
+            per_device_train_batch_size=1,
+            gradient_accumulation_steps=8,
             gradient_checkpointing=True,
             learning_rate=2e-4,
             weight_decay=0.01,
@@ -302,6 +249,19 @@ class ComediaLoRATrainer:
             callbacks=[EarlyStoppingCallback(early_stopping_patience=5)],
         )
 
+        trainer.data_collator = MaskThinkCollator(trainer.data_collator, tokenizer)
+
+        probe = trainer.data_collator([trainer.train_dataset[i] for i in range(2)])
+        for i in range(2):
+            keep = probe["labels"][i] != -100
+            text = tokenizer.decode(probe["input_ids"][i][keep])
+            logger.info(f"mask probe {i}: {int(keep.sum())} tokens in loss")
+            logger.info(f"  starts: {text[:100]!r}")
+            if int(keep.sum()) == 0:
+                raise ValueError("Everything masked; the </think> search ran past the sequence.")
+            if "<think>" in text or "ELENCO" in text:
+                raise ValueError("Reasoning still in the loss; masking failed.")
+
         trainer.model.print_trainable_parameters()
         attached = {n.split(".lora_A")[0].split(".")[-1] for n, _ in trainer.model.named_modules() if ".lora_A" in n}
         logger.info(f"LoRA attached to: {sorted(attached)}")
@@ -318,16 +278,33 @@ class ComediaLoRATrainer:
         trainer.log_metrics("train", train_metrics)
         trainer.save_metrics("train", train_metrics)
 
-        logger.info("Running final evaluation on the best model checkpoint...")
-        eval_metrics = trainer.evaluate()
-        trainer.log_metrics("eval", eval_metrics)
-        trainer.save_metrics("eval", eval_metrics)
-
         final_save_path = self.output_dir / self.adapter_name
         trainer.model.save_pretrained(str(final_save_path))
         tokenizer.save_pretrained(str(final_save_path))
         trainer.save_state()
         logger.info(f"Training complete. Adapter and metrics saved to {final_save_path}")
+
+        # Eval phase
+        logger.info("Measuring adapter contribution against the frozen base...")
+        lora_metrics = trainer.evaluate(metric_key_prefix="lora")
+        with trainer.model.disable_adapter():
+            base_metrics = trainer.evaluate(metric_key_prefix="base")
+
+        trainer.log_metrics("eval", lora_metrics)
+        trainer.save_metrics("eval", lora_metrics)
+        lora_loss = lora_metrics["lora_loss"]
+        base_loss = base_metrics["base_loss"]
+        result = {
+            "rank": self.rank,
+            "base_loss": base_loss,
+            "lora_loss": lora_loss,
+            "delta": base_loss - lora_loss,
+            "base_ppl": float(torch.exp(torch.tensor(base_loss))),
+            "lora_ppl": float(torch.exp(torch.tensor(lora_loss))),
+            "n_eval": len(eval_data),
+        }
+        (self.output_dir / f"eval_r{self.rank}.json").write_text(json.dumps(result, indent=2), encoding="utf-8")
+        logger.info(f"base {base_loss:.4f} -> lora {lora_loss:.4f} | delta {base_loss - lora_loss:+.4f}")
 
 
 class ComediaLoRAGenerator:
@@ -376,8 +353,22 @@ class ComediaLoRAGenerator:
             logger.error(f"Initialization failed: {e}")
             self.model = None
 
+    @staticmethod
+    def _normalise_reasoning(reasoning_text: str, trim_incomplete: bool = True) -> str:
+        closed = "</think>" in reasoning_text
+
+        body = reasoning_text.split("</think>")[0]
+        body = re.sub(r"</?think>", "", body).strip()
+
+        if not closed and trim_incomplete:
+            cut = max(body.rfind(". "), body.rfind(".\n"), body.rfind("! "), body.rfind("? "))
+            if cut > 200:
+                body = body[: cut + 1]
+
+        return f"<think>\n{body}\n</think>\n\n"
+
     def _generate_bounded(
-        self, messages: list, reasoning_budget: int = 6000, answer_budget: int = 2500
+        self, messages: list, reasoning_budget: int = 5500, answer_budget: int = 2500
     ) -> Tuple[str, str]:
         prompt = self.tokenizer.apply_chat_template(
             messages, tokenize=False, add_generation_prompt=True, enable_thinking=True
@@ -394,9 +385,7 @@ class ComediaLoRAGenerator:
                     temperature=1.0,
                     top_p=0.95,
                     top_k=20,
-                    min_p=0.0,
-                    repetition_penalty=1.0,
-                    logits_processor=LogitsProcessorList([RepetitionControlProcessor(1.0, 0.3, prompt_len)]),
+                    logits_processor=LogitsProcessorList([RepetitionControlProcessor(1.1, 0.3, prompt_len)]),
                     stopping_criteria=StoppingCriteriaList([ThinkCloseStoppingCriteria(self.tokenizer, prompt_len)]),
                 )
             reasoning_text = self.tokenizer.decode(
@@ -408,11 +397,8 @@ class ComediaLoRAGenerator:
             torch.cuda.synchronize()
             torch.cuda.empty_cache()
 
-        if "</think>" in reasoning_text:
-            reasoning_text = reasoning_text.split("</think>")[0] + "</think>\n\n"
-        else:
-            logger.info("Reasoning hit its token budget. Forcing closure.")
-            reasoning_text = f"<think>{reasoning_text.split('<think>')[-1]}\n</think>\n\n"
+        logger.warning(f"Reasoning did not close within {reasoning_budget} tokens.")
+        reasoning_text = self._normalise_reasoning(reasoning_text)
 
         inputs_answer = self.tokenizer(prompt + reasoning_text, return_tensors="pt").to(self.model.device)
 
@@ -426,9 +412,7 @@ class ComediaLoRAGenerator:
                     temperature=0.8,
                     top_p=0.95,
                     top_k=20,
-                    min_p=0.0,
-                    repetition_penalty=1.0,
-                    logits_processor=LogitsProcessorList([RepetitionControlProcessor(1.0, 0.3, prompt_len)]),
+                    logits_processor=LogitsProcessorList([RepetitionControlProcessor(1.1, 0.3, prompt_len)]),
                 )
                 answer_text = self.tokenizer.decode(
                     out_answer[0, inputs_answer["input_ids"].shape[1] :], skip_special_tokens=True
@@ -539,7 +523,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--mode",
         type=str,
-        choices=["train", "generate", "eval"],
+        choices=["train", "generate"],
         required=True,
         help="Select 'train' to fine-tune or 'generate' to batch process prompts.",
     )
@@ -614,18 +598,3 @@ if __name__ == "__main__":
             json.dump(output_data, f, ensure_ascii=False, indent=4)
 
         logger.info(f"Generation complete! Results saved to {output_path.name}")
-
-    elif args.mode == "eval":
-        trainer = ComediaLoRATrainer(rank=args.rank)
-        default = trainer.output_dir / trainer.adapter_name
-        targets = (
-            [Path(args.adapter_path).resolve()]
-            if args.adapter_path
-            else [default]
-            + [c["path"] for c in trainer._list_checkpoints(trainer.output_dir / f"checkpoints_r{args.rank}")]
-        )
-        results = [trainer.evaluate_checkpoint(p) for p in targets]
-        results = [r for r in results if r]
-        out = script_dir / f"eval_r{args.rank}.json"
-        out.write_text(json.dumps(results, ensure_ascii=False, indent=2), encoding="utf-8")
-        logger.info(f"Wrote {out}")
