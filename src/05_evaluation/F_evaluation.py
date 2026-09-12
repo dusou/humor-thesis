@@ -1,3 +1,4 @@
+import argparse
 from dotenv import load_dotenv
 import json
 import logging
@@ -28,8 +29,9 @@ METRICS = ["novelty", "clarity", "relevance", "intelligence", "empathy", "cultur
 
 
 class ComedyScriptEvaluator:
-    def __init__(self, input_dir="../../data/06_comedia_outputs", output_dir="../../data/07_eval_results"):
+    def __init__(self, input_dir="../../data/06_comedia_outputs", output_dir="../../data/07_eval_results", repeats=3):
         script_dir = Path(__file__).resolve().parent
+        self.repeats = repeats
         self.input_dir = (script_dir / input_dir).resolve()
         self.output_dir = (script_dir / output_dir).resolve()
         self.output_dir.mkdir(parents=True, exist_ok=True)
@@ -125,7 +127,7 @@ AVALIAÇÕES:
                     {"role": "user", "content": user_prompt},
                 ],
                 temperature=0.4,
-                max_completion_tokens=300,
+                max_completion_tokens=500,
             )
             return response.choices[0].message.content.strip()
         except Exception as e:
@@ -143,6 +145,8 @@ AVALIAÇÕES:
         for file_path in json_files:
             arch_name = file_path.stem.replace("_outputs", "")
             raw_path = self.output_dir / f"{arch_name}_raw_judgements.jsonl"
+            diagnostics_path = self.output_dir / "Diagnostics.md"
+            diagnostics_path.write_text("# Diagnostic summaries\n\n", encoding="utf-8")
             with raw_path.open("w", encoding="utf-8") as raw_f:
                 logger.info(f"=== Starting Evaluation for Architecture: {arch_name} ===")
 
@@ -162,33 +166,41 @@ AVALIAÇÕES:
                         continue
 
                     for persona in PERSONAS:
-                        result = self.evaluate_with_persona(persona, format_type, premise, script)
+                        runs = []
+                        for rep in range(self.repeats):
+                            result = self.evaluate_with_persona(persona, format_type, premise, script)
 
-                        raw_f.write(
-                            json.dumps(
-                                {
-                                    "architecture": arch_name,
-                                    "theme": theme,
-                                    "format": format_type,
-                                    "persona": persona,
-                                    "premise": premise,
-                                    "word_count": len(script.split()),
-                                    "response": result,
-                                },
-                                ensure_ascii=False,
+                            raw_f.write(
+                                json.dumps(
+                                    {
+                                        "architecture": arch_name,
+                                        "theme": theme,
+                                        "format": format_type,
+                                        "persona": persona,
+                                        "repeat": rep,
+                                        "premise": premise,
+                                        "word_count": len(script.split()),
+                                        "response": result,
+                                    },
+                                    ensure_ascii=False,
+                                )
+                                + "\n"
                             )
-                            + "\n"
-                        )
-                        raw_f.flush()
+                            raw_f.flush()
 
-                        if not result:
+                            if not result:
+                                continue
+                            missing = [m for m in METRICS if m not in result]
+                            if missing:
+                                logger.warning(f"{persona} rep {rep}: missing {missing}.")
+                                continue
+                            runs.append(result)
+
+                        if not runs:
+                            logger.warning(f"{persona}: no valid judgements for '{theme}'.")
                             continue
 
-                        reasoning_text = result.get("reasoning", "")
-                        missing = [m for m in METRICS if m not in result]
-                        if missing:
-                            logger.warning(f"{persona}: missing {missing}.")
-                            continue
+                        reasoning_text = runs[0].get("reasoning", "")
                         all_reasonings.append(reasoning_text)
 
                         if persona == "Portuguese (Portugal) Specialist":
@@ -204,10 +216,13 @@ AVALIAÇÕES:
                             "Persona": persona,
                             "Reasoning": reasoning_text,
                             "Word_count": len(script.split()),
+                            "N_Repeats": len(runs),
                         }
 
                         for m in METRICS:
-                            record[m] = float(result[m])
+                            values = [float(r[m]) for r in runs]
+                            record[m] = sum(values) / len(values)
+                            record[f"{m}_rep_sd"] = pd.Series(values).std(ddof=1) if len(values) > 1 else 0.0
 
                         arch_persona_records.append(record)
 
@@ -228,6 +243,7 @@ AVALIAÇÕES:
                     "Architecture": arch_name,
                     "N_Items": len(per_item),
                     "N_Evaluations": len(df_arch),
+                    "N_Repeats": self.repeats,
                 }
                 for m in METRICS:
                     avg_record[m] = round(per_item[m].mean(), 2)
@@ -238,12 +254,15 @@ AVALIAÇÕES:
                 )
                 avg_record["Mean_Word_Count"] = int(df_arch["Word_count"].mean())
 
-                avg_record["Diagnostic_Strengths_Summary"] = self.summarize_architecture(
-                    arch_name, all_reasonings, summary_type="strengths"
-                )
-                avg_record["Diagnostic_Flaws_Summary"] = self.summarize_architecture(
-                    arch_name, all_reasonings, summary_type="flaws"
-                )
+                strengths = self.summarize_architecture(arch_name, all_reasonings, summary_type="strengths")
+                flaws = self.summarize_architecture(arch_name, all_reasonings, summary_type="flaws")
+
+                with (self.output_dir / "Diagnostics.md").open("a", encoding="utf-8") as md:
+                    md.write(
+                        f"## {arch_name}\n\n**Pontos fortes**\n\n{strengths}\n\n**Fraquezas**\n\n{flaws}\n\n---\n\n"
+                    )
+
+                avg_record["Judge_Repeat_SD"] = round(df_arch[[f"{m}_rep_sd" for m in METRICS]].mean().mean(), 3)
                 master_aggregated_data.append(avg_record)
 
                 per_item.round(2).to_csv(self.output_dir / f"{arch_name}_per_item.csv", encoding="utf-8")
@@ -260,5 +279,9 @@ AVALIAÇÕES:
 
 
 if __name__ == "__main__":
-    evaluator = ComedyScriptEvaluator()
+    parser = argparse.ArgumentParser(description="ComedIA LLM-as-a-Judge evaluation")
+    parser.add_argument("--repeats", type=int, default=3, help="Judgements per persona per item")
+    args = parser.parse_args()
+
+    evaluator = ComedyScriptEvaluator(repeats=args.repeats)
     evaluator.run_evaluation()
