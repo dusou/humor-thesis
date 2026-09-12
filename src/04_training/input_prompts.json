@@ -12,7 +12,7 @@
     {
         "theme": "football",
         "format": "sketch",
-        "prompt": "Um sketch televisivo sobre dois adeptos de futebol rivais que são forçados a assistir a um derby importante juntos porque ficaram presos num elevador."
+        "prompt": "Dois comentadores desportivos a discutir um lance duvidoso sem chegar a conclusão nenhuma."
     },
     {
         "theme": "sketch tema livre",
@@ -38,6 +38,21 @@
         "theme": "verão no Algarve",
         "format": "sketch",
         "prompt": "Um artigo de opinião humorístico sobre as regras não escritas das férias no Algarve em agosto."
+    },
+    {
+        "theme": "entrevista desviada",
+        "format": "sketch",
+        "prompt": "Uma entrevista de televisão em que o entrevistado desvia sistematicamente qualquer pergunta para promover o seu novo livro."
+    },
+    {
+        "theme": "telejornal absurdo",
+        "format": "sketch",
+        "prompt": "Um pivô de telejornal a dar notícias cada vez mais absurdas com total seriedade profissional."
+    },
+    {
+        "theme": "publicidade",
+        "format": "sketch",
+        "prompt": "Um anúncio televisivo a vender um produto cujas desvantagens são anunciadas com entusiasmo."
     },
     {
         "theme": "saúde pública",

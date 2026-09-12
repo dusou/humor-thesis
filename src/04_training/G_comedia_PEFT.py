@@ -58,19 +58,19 @@ class ThinkCloseStoppingCriteria(StoppingCriteria):
 
 
 class RepetitionControlProcessor(LogitsProcessor):
-    """Presence is flat; frequency scales with count and is what breaks a
-    running loop. Cap keeps common function words usable in long generations."""
+    """Penalise repetition within a recent window only."""
 
-    def __init__(self, presence, frequency, prompt_len, max_freq=4.0):
+    def __init__(self, presence, frequency, prompt_len, max_freq=4.0, window=64):
         self.presence, self.frequency = presence, frequency
-        self.prompt_len, self.max_freq = prompt_len, max_freq
+        self.prompt_len, self.max_freq, self.window = prompt_len, max_freq, window
 
     def __call__(self, input_ids, scores):
         gen = input_ids[:, self.prompt_len :]
         for i in range(scores.shape[0]):
-            if not gen[i].numel():
+            recent = gen[i][-self.window :]
+            if not recent.numel():
                 continue
-            toks, counts = torch.unique(gen[i], return_counts=True)
+            toks, counts = torch.unique(recent, return_counts=True)
             scores[i, toks] -= self.presence + torch.clamp(self.frequency * counts.to(scores.dtype), max=self.max_freq)
         return scores
 
@@ -368,7 +368,7 @@ class ComediaLoRAGenerator:
         return f"<think>\n{body}\n</think>\n\n"
 
     def _generate_bounded(
-        self, messages: list, reasoning_budget: int = 5500, answer_budget: int = 2500
+        self, messages: list, reasoning_budget: int = 5000, answer_budget: int = 2250
     ) -> Tuple[str, str]:
         prompt = self.tokenizer.apply_chat_template(
             messages, tokenize=False, add_generation_prompt=True, enable_thinking=True
@@ -384,8 +384,8 @@ class ComediaLoRAGenerator:
                     do_sample=True,
                     temperature=1.0,
                     top_p=0.95,
-                    top_k=20,
-                    logits_processor=LogitsProcessorList([RepetitionControlProcessor(1.1, 0.3, prompt_len)]),
+                    top_k=50,
+                    logits_processor=LogitsProcessorList([RepetitionControlProcessor(1.05, 0.3, prompt_len)]),
                     stopping_criteria=StoppingCriteriaList([ThinkCloseStoppingCriteria(self.tokenizer, prompt_len)]),
                 )
             reasoning_text = self.tokenizer.decode(
@@ -412,8 +412,8 @@ class ComediaLoRAGenerator:
                     do_sample=True,
                     temperature=0.8,
                     top_p=0.95,
-                    top_k=20,
-                    logits_processor=LogitsProcessorList([RepetitionControlProcessor(1.1, 0.3, prompt_len)]),
+                    top_k=50,
+                    logits_processor=LogitsProcessorList([RepetitionControlProcessor(1.05, 0.3, prompt_len)]),
                 )
                 answer_text = self.tokenizer.decode(
                     out_answer[0, inputs_answer["input_ids"].shape[1] :], skip_special_tokens=True
@@ -432,66 +432,6 @@ class ComediaLoRAGenerator:
 
         return clean_reasoning, clean_answer.strip()
 
-    def _cleanup_pass(self, format_type: str, raw_text: str) -> str:
-        cleanup_prompt = f"""
-                    Abaixo está um rascunho de um texto de comédia portuguesa (formato: {format_type})
-                    gerado automaticamente, que pode conter alguns tipos de problemas como:
-                    1. Repetição de falas ou frases no final do texto (ficou "preso" a repetir a mesma linha).
-                    2. Pequenos erros de formatação, como tags de personagem malformadas (ex: "[SPEAKER_00>" em vez de "[SPEAKER_00]").
-                    3. Personagens não existentes no sketch podem surgir subitamente entre parentesis retos.
-                    4. Palavras que podem aparecer em Português do Brasil em vez de Português Europeu.
-    
-                    --- RASCUNHO ---
-                    {raw_text}
-                    --- FIM DO RASCUNHO ---
-    
-                    Tarefa: devolve o texto corrigido, removendo quaisquer repetições do final e corrigindo
-                    erros de formatação. Se o texto tiver sido cortado a meio de uma repetição, termina-o de
-                    forma muito breve e natural (no máximo 2 a 3 falas adicionais).
-    
-                    IMPORTANTE:
-                    - Não alteres o conteúdo, o enredo ou o estilo do resto do texto a não ser que seja necessário para resolver os problemas acima.
-                    - Não acrescentes novas personagens ou temas.
-                    - Devolve apenas o texto corrigido, sem comentários, notas ou explicações.
-                    - Usa Português Europeu.
-                    """
-
-        messages = [
-            {
-                "role": "system",
-                "content": "És um editor de guiões de comédia portuguesa. A tua única tarefa é corrigir repetições e erros de formatação, mantendo tudo o resto inalterado.",
-            },
-            {"role": "user", "content": cleanup_prompt},
-        ]
-
-        prompt = self.tokenizer.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True, enable_thinking=False
-        )
-        inputs = self.tokenizer(prompt, return_tensors="pt").to(self.model.device)
-
-        input_len = inputs["input_ids"].shape[1]
-        cleanup_budget = min(input_len + 50, 3500)
-
-        try:
-            with self.model.disable_adapter():
-                with torch.inference_mode():
-                    out = self.model.generate(
-                        **inputs,
-                        max_new_tokens=cleanup_budget,
-                        do_sample=True,
-                        temperature=0.3,
-                        repetition_penalty=1.05,
-                        top_p=0.9,
-                    )
-                cleaned = self.tokenizer.decode(out[0, input_len:], skip_special_tokens=True)
-        finally:
-            del inputs
-            gc.collect()
-            torch.cuda.synchronize()
-            torch.cuda.empty_cache()
-
-        return re.sub(r"^(?:assistant\s*)+", "", cleaned.strip(), flags=re.IGNORECASE)
-
     def generate(self, query: str, format_type: str = "sketch") -> Dict:
         if self.dry_run or not self.model:
             return {"text": f"[DRY RUN] Generated mock {format_type} output.", "sources": []}
@@ -502,12 +442,10 @@ class ComediaLoRAGenerator:
                 {"role": "user", "content": f"{MACRO_INSTRUCTION}\n\n{query}"},
             ]
             reasoning, response = self._generate_bounded(messages)
-            clean_response = self._cleanup_pass(format_type, response)
             return {
                 "response": response,
                 "sources": [],
                 "reasoning": reasoning,
-                "response_with_cleanup": clean_response,
             }
         except Exception as e:
             logger.error(f"Generation failed: {e}")
@@ -515,7 +453,6 @@ class ComediaLoRAGenerator:
                 "response": "ERROR: Generation failed.",
                 "sources": [],
                 "reasoning": "ERROR: Generation failed.",
-                "response_with_cleanup": "ERROR: Generation failed.",
             }
 
 
@@ -590,7 +527,6 @@ if __name__ == "__main__":
                     "format": format_type,
                     "prompt": prompt,
                     "reasoning": generation_result.get("reasoning", ""),
-                    "clean_output": generation_result.get("response_with_cleanup", ""),
                     "output": generation_result["response"],
                 }
             )

@@ -112,7 +112,7 @@ class ComediaRAG:
                 with open(filepath, "r", encoding="utf-8") as f:
                     doc_data = json.load(f)
 
-                    search_text = f"{doc_data.get('content', '')}\n{doc_data.get('comedic_metadata', '')}"
+                    search_text = doc_data.get("content", "")
                     metadata = {
                         "sketch_id": doc_data.get("sketch_id", "UNKNOWN"),
                         "clean_content": doc_data.get("content", ""),
@@ -318,7 +318,7 @@ if __name__ == "__main__":
     script_dir = Path(__file__).resolve().parent
     corpus_dir = os.path.normpath(script_dir / "../../data/04_rag_ready")
     input_path = os.path.normpath(script_dir / "input_prompts.json")
-    output_path = os.path.normpath(script_dir / "../../data/06_comedia_outputs/ComedIA_RAG_outputs.json")
+    output_path = os.path.normpath(script_dir / "../../data/06_comedia_outputs/ComedIA_RAG_V2_outputs.json")
 
     # load input dataset
     if not input_path:
