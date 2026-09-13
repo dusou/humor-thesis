@@ -142,11 +142,12 @@ AVALIAÇÕES:
 
         master_aggregated_data = []
 
+        diagnostics_path = self.output_dir / "Diagnostics.md"
+        diagnostics_path.write_text("# Diagnostic summaries\n\n", encoding="utf-8")
+
         for file_path in json_files:
             arch_name = file_path.stem.replace("_outputs", "")
             raw_path = self.output_dir / f"{arch_name}_raw_judgements.jsonl"
-            diagnostics_path = self.output_dir / "Diagnostics.md"
-            diagnostics_path.write_text("# Diagnostic summaries\n\n", encoding="utf-8")
             with raw_path.open("w", encoding="utf-8") as raw_f:
                 logger.info(f"=== Starting Evaluation for Architecture: {arch_name} ===")
 
@@ -258,9 +259,7 @@ AVALIAÇÕES:
                 flaws = self.summarize_architecture(arch_name, all_reasonings, summary_type="flaws")
 
                 with (self.output_dir / "Diagnostics.md").open("a", encoding="utf-8") as md:
-                    md.write(
-                        f"## {arch_name}\n\n**Pontos fortes**\n\n{strengths}\n\n**Fraquezas**\n\n{flaws}\n\n---\n\n"
-                    )
+                    md.write(f"## {arch_name}\n\n**Pontos fortes**\n\n{strengths}\n\n**Fraquezas**\n\n{flaws}\n\n")
 
                 avg_record["Judge_Repeat_SD"] = round(df_arch[[f"{m}_rep_sd" for m in METRICS]].mean().mean(), 3)
                 master_aggregated_data.append(avg_record)
