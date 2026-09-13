@@ -1,18 +1,18 @@
 [
     {
-        "theme": "bureaucracy",
+        "theme": "burocracia",
         "format": "sketch",
         "prompt": "Um sketch cómico televisivo sobre uma fila de espera interminável numa repartição pública das Finanças."
     },
     {
-        "theme": "politics",
+        "theme": "politica",
         "format": "sketch",
         "prompt": "Um debate autárquico numa pequena vila do interior de Portugal onde os candidatos políticos prometem coisas absurdas para ganhar votos."
     },
     {
-        "theme": "football",
+        "theme": "futebol",
         "format": "sketch",
-        "prompt": "Dois comentadores desportivos a discutir um lance duvidoso sem chegar a conclusão nenhuma."
+        "prompt": "Dois comentadores desportivos discutem um lance duvidoso sem chegar a conclusão nenhuma."
     },
     {
         "theme": "sketch tema livre",
@@ -27,7 +27,7 @@
     {
         "theme": "febre do padel",
         "format": "sketch",
-        "prompt": "Um sketch televisivo disfarçado de documentário sobre a 'epidemia' de Padel em Portugal."
+        "prompt": "Uma entrevista com um homem que se tornou vítima da \"epidemia\" do Padel em Portugal."
     },
     {
         "theme": "obras públicas",
@@ -50,9 +50,9 @@
         "prompt": "Um pivô de telejornal a dar notícias cada vez mais absurdas com total seriedade profissional."
     },
     {
-        "theme": "publicidade",
+        "theme": "pandemia",
         "format": "sketch",
-        "prompt": "Um anúncio televisivo a vender um produto cujas desvantagens são anunciadas com entusiasmo."
+        "prompt": "Um apresentador televisivo com um especialista convidado a explicar dados epidemiológicos absurdos da pandemia da COVID-19 que claramente inventou."
     },
     {
         "theme": "saúde pública",
@@ -60,7 +60,7 @@
         "prompt": "Uma crónica irónica sobre a odisseia épica que é tentar ser atendido nas urgências do SNS durante o inverno."
     },
     {
-        "theme": "newspaper tema livre",
+        "theme": "jornal tema livre",
         "format": "newspaper",
         "prompt": "Um tema livre à tua escolha que esteja assente na realidade moderna do público português."
     },
@@ -70,7 +70,7 @@
         "prompt": "Um monólogo de estilo late-night sobre o caos do eclipse solar de 12 de agosto de 2026."
     },
     {
-        "theme": "tv_show tema livre",
+        "theme": "tv tema livre",
         "format": "tv_show",
         "prompt": "Um tema livre à tua escolha que esteja assente na realidade moderna do público português."
     }
