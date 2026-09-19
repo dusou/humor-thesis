@@ -38,6 +38,14 @@ if str(data_process_dir) not in sys.path:
 
 from D_data_transform import MACRO_INSTRUCTION, SYSTEM_PROMPT
 
+K_VALUES = [1, 2, 3, 4]
+K_SWEEP_THRESHOLD = 0.50
+
+THRESHOLD_VALUES = [0.50, 0.48, 0.46, 0.44, 0.42, 0.40]
+THRESHOLD_SWEEP_K = 4
+
+SEED = 42
+
 
 class ThinkCloseStoppingCriteria(StoppingCriteria):
     """
@@ -75,6 +83,7 @@ class RepetitionControlProcessor(LogitsProcessor):
 class ComediaRAG:
     """
     Implements Architecture A (RAG) using LangChain, ChromaDB, and local Qwen-3.5-9B.
+    Retrieval parameters are passed per call so one loaded model serves the whole sweep.
     """
 
     def __init__(
@@ -112,7 +121,7 @@ class ComediaRAG:
                 with open(filepath, "r", encoding="utf-8") as f:
                     doc_data = json.load(f)
 
-                    search_text = f"{doc_data.get('content', '')}\n{doc_data.get('comedic_metadata', '')}"
+                    search_text = doc_data.get("content", "")
                     metadata = {
                         "sketch_id": doc_data.get("sketch_id", "UNKNOWN"),
                         "clean_content": doc_data.get("content", ""),
@@ -239,20 +248,21 @@ class ComediaRAG:
 
         return reasoning_text, clean_answer.strip()
 
-    def generate(self, query: str, format_type: str = "sketch") -> dict:
+    def generate(self, query: str, k: int, threshold: float, format_type: str = "sketch") -> dict:
         if self.dry_run:
-            return {"text": f"[DRY RUN] Generated mock {format_type} output.", "sources": []}
+            return {
+                "sources": [],
+                "reasoning": f"[DRY RUN] k={k} threshold={threshold}",
+                "response": f"[DRY RUN] Generated mock {format_type} output.",
+            }
 
         try:
             # explicitly retrieve the documents
-            docs_with_scores = self.vector_store.similarity_search_with_score(query, k=3)
-
-            SCORE_THRESHOLD = 0.46
-            filtered = [(doc, score) for doc, score in docs_with_scores if score <= SCORE_THRESHOLD]
+            docs_with_scores = self.vector_store.similarity_search_with_score(query, k=k)
+            filtered = [(doc, score) for doc, score in docs_with_scores if score <= threshold]
 
             # extract IDs and actual text
             retrieved_contexts = []
-            retrieved_ids = []
             for doc, score in filtered:
                 logger.info(
                     f'\tscore={score:.4f} // id={doc.metadata["sketch_id"]} // preview="{doc.metadata["clean_content"][:30]}"'
@@ -261,7 +271,6 @@ class ComediaRAG:
                 s_id = doc.metadata.get("sketch_id", "UNKNOWN")
                 s_text = doc.metadata.get("clean_content", "")
 
-                retrieved_ids.append(s_id)
                 retrieved_contexts.append({"sketch_id": s_id, "score": score, "text": s_text})
 
             docs = [doc for doc, _ in filtered]
@@ -274,7 +283,7 @@ class ComediaRAG:
                     break
                 formatted_context += f"--- EXEMPLO {i} ---\n{doc.metadata['clean_content']}\n"
 
-            if filtered:
+            if formatted_context:
                 messages = [
                     {"role": "system", "content": SYSTEM_PROMPT},
                     {
@@ -310,18 +319,87 @@ class ComediaRAG:
             }
 
 
+def run_configuration(rag_system, prompts_list, k, threshold, output_path, overwrite):
+    if output_path.exists() and not overwrite:
+        logger.info(f"{output_path.name} already exists, skipping.")
+        return
+
+    logger.info(f"=== k={k} // threshold={threshold:.2f} // {output_path.name} ===")
+    set_seed(SEED)
+
+    output_data = []
+    total_items = len(prompts_list)
+
+    for idx, item in enumerate(prompts_list, start=1):
+        theme = item.get("theme", "general")
+        format_type = item.get("format", "sketch")
+        prompt = item.get("prompt", "")
+
+        logger.info(f"Processing ({idx}/{total_items}) // Theme: '{theme}' // Format: '{format_type}'")
+
+        generation_result = rag_system.generate(query=prompt, k=k, threshold=threshold, format_type=format_type)
+
+        output_data.append(
+            {
+                "theme": theme,
+                "format": format_type,
+                "prompt": prompt,
+                "k": k,
+                "score_threshold": threshold,
+                "n_retrieved": len(generation_result["sources"]),
+                "retrieved_context": generation_result["sources"],
+                "reasoning": generation_result.get("reasoning", ""),
+                "output": generation_result["response"],
+            }
+        )
+
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    with open(output_path, "w", encoding="utf-8") as f:
+        json.dump(output_data, f, ensure_ascii=False, indent=4)
+
+    retrieved = [x["n_retrieved"] for x in output_data]
+    logger.info(
+        f"Saved {output_path.name} // documents retrieved: min {min(retrieved)} "
+        f"max {max(retrieved)} mean {sum(retrieved) / len(retrieved):.1f}"
+    )
+
+
+def preview_retrieval(rag_system, prompts_list):
+    logger.info("=== Retrieval preview ===")
+    all_scores = []
+
+    for item in prompts_list:
+        hits = rag_system.vector_store.similarity_search_with_score(item.get("prompt", ""), k=max(K_VALUES))
+        scores = [round(s, 3) for _, s in hits]
+        all_scores += [s for _, s in hits]
+        logger.info(f"{item.get('theme', '?')[:28]:30s} {scores}")
+
+    all_scores.sort()
+    logger.info(f"min {all_scores[0]:.3f} // median {all_scores[len(all_scores) // 2]:.3f} // max {all_scores[-1]:.3f}")
+    for t in THRESHOLD_VALUES:
+        kept = sum(1 for s in all_scores if s <= t)
+        logger.info(f"\tthreshold {t:.2f} keeps {kept}/{len(all_scores)} documents")
+
+
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="ComedIA RAG Batch Generator")
+    parser = argparse.ArgumentParser(description="ComedIA RAG Parameter Sweep")
     parser.add_argument("--dry-run", action="store_true", help="Run without loading Qwen model")
+    parser.add_argument("--overwrite", action="store_true", help="Regenerate existing configurations")
+    parser.add_argument("--preview", action="store_true", help="Print retrieval scores and exit")
+    parser.add_argument("--sweep", choices=["k", "threshold", "both"], default="both")
     args = parser.parse_args()
 
     script_dir = Path(__file__).resolve().parent
-    corpus_dir = os.path.normpath(script_dir / "../../data/04_rag_ready")
-    input_path = os.path.normpath(script_dir / "input_prompts.json")
-    output_path = os.path.normpath(script_dir / "../../data/06_comedia_outputs/ComedIA_RAG_outputs.json")
+    corpus_dir = (script_dir / "../../data/04_rag_ready").resolve()
+    input_path = (script_dir / "input_prompts.json").resolve()
+    output_dir = (script_dir / "../../data/06_comedia_outputs").resolve()
+    output_dir.mkdir(parents=True, exist_ok=True)
 
     # load input dataset
-    if not input_path:
+    if not input_path.exists():
         logger.error(f"Input file '{input_path}' not found.")
         exit(1)
 
@@ -331,35 +409,28 @@ if __name__ == "__main__":
     logger.info(f"Loaded {len(prompts_list)} prompt pairs from {input_path}")
 
     # initialize RAG system
-    rag_system = ComediaRAG(corpus_dir=str(corpus_dir), llm_model_name="Qwen/Qwen3.5-9B", dry_run=args.dry_run)
+    rag_system = ComediaRAG(
+        corpus_dir=str(corpus_dir),
+        llm_model_name="Qwen/Qwen3.5-9B",
+        dry_run=args.dry_run or args.preview,
+    )
 
-    # batch processing loop
-    output_data = []
-    total_items = len(prompts_list)
+    if args.preview:
+        preview_retrieval(rag_system, prompts_list)
+        exit(0)
 
-    set_seed(42)
+    configurations = []
+    if args.sweep in ("k", "both"):
+        for k in K_VALUES:
+            configurations.append((k, K_SWEEP_THRESHOLD, output_dir / f"ComedIA_outputs_k{k}.json"))
+    if args.sweep in ("threshold", "both"):
+        for threshold in THRESHOLD_VALUES:
+            tag = f"s{int(round(threshold * 100))}"
+            configurations.append((THRESHOLD_SWEEP_K, threshold, output_dir / f"ComedIA_outputs_{tag}.json"))
 
-    for idx, item in enumerate(prompts_list, start=1):
-        theme = item.get("theme", "general")
-        format_type = item.get("format", "sketch")
-        prompt = item.get("prompt", "")
+    logger.info(f"Running {len(configurations)} configurations over {len(prompts_list)} prompts each")
 
-        logger.info(f"Processing ({idx}/{total_items}) // Theme: '{theme}' // Format: '{format_type}'")
+    for k, threshold, path in configurations:
+        run_configuration(rag_system, prompts_list, k, threshold, path, args.overwrite)
 
-        generation_result = rag_system.generate(query=prompt, format_type=format_type)
-
-        output_data.append(
-            {
-                "theme": theme,
-                "format": format_type,
-                "prompt": prompt,
-                "retrieved_context": generation_result["sources"],
-                "reasoning": generation_result.get("reasoning", ""),
-                "output": generation_result["response"],
-            }
-        )
-
-    with open(output_path, "w", encoding="utf-8") as f:
-        json.dump(output_data, f, ensure_ascii=False, indent=4)
-
-    logger.info(f"Batch generation complete! Saved {len(output_data)} generations to: {output_path}")
+    logger.info("Sweep complete.")

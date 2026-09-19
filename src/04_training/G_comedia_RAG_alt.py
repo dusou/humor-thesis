@@ -245,9 +245,9 @@ class ComediaRAG:
 
         try:
             # explicitly retrieve the documents
-            docs_with_scores = self.vector_store.similarity_search_with_score(query, k=2)
+            docs_with_scores = self.vector_store.similarity_search_with_score(query, k=3)
 
-            SCORE_THRESHOLD = 0.50
+            SCORE_THRESHOLD = 0.46
             filtered = [(doc, score) for doc, score in docs_with_scores if score <= SCORE_THRESHOLD]
 
             # extract IDs and actual text
