@@ -12,12 +12,11 @@ import sys
 import torch
 import transformers
 from transformers import (
-    LogitsProcessor,
     LogitsProcessorList,
     set_seed,
-    StoppingCriteria,
     StoppingCriteriaList,
 )
+from typing import Tuple
 
 # Setup logging
 logging.basicConfig(
@@ -32,44 +31,22 @@ transformers.logging.set_verbosity_error()
 os.environ["HF_HUB_DISABLE_TELEMETRY"] = "1"
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
-data_process_dir = (Path(__file__).resolve().parent.parent / "02_data_process").resolve()
-if str(data_process_dir) not in sys.path:
-    sys.path.insert(0, str(data_process_dir))
+src_dir = str(Path(__file__).resolve().parents[1])
+if src_dir not in sys.path:
+    sys.path.insert(0, src_dir)
 
-from D_data_transform import MACRO_INSTRUCTION, SYSTEM_PROMPT
-
-
-class ThinkCloseStoppingCriteria(StoppingCriteria):
-    """
-    Thinking Block stopping criteria
-    """
-
-    def __init__(self, tokenizer, prompt_len):
-        self.tokenizer = tokenizer
-        self.prompt_len = prompt_len
-
-    def __call__(self, input_ids, scores, **kwargs):
-        tail_ids = input_ids[0, self.prompt_len :]
-        tail_text = self.tokenizer.decode(tail_ids[-8:], skip_special_tokens=False)
-        return "</think>" in tail_text
-
-
-class RepetitionControlProcessor(LogitsProcessor):
-    """Penalise repetition within a recent window only."""
-
-    def __init__(self, presence, frequency, prompt_len, max_freq=4.0, window=64):
-        self.presence, self.frequency = presence, frequency
-        self.prompt_len, self.max_freq, self.window = prompt_len, max_freq, window
-
-    def __call__(self, input_ids, scores):
-        gen = input_ids[:, self.prompt_len :]
-        for i in range(scores.shape[0]):
-            recent = gen[i][-self.window :]
-            if not recent.numel():
-                continue
-            toks, counts = torch.unique(recent, return_counts=True)
-            scores[i, toks] -= self.presence + torch.clamp(self.frequency * counts.to(scores.dtype), max=self.max_freq)
-        return scores
+from common import (
+    ANSWER_BUDGET,
+    ANSWER_SAMPLING,
+    clean_answer,
+    get_instruction,
+    normalise_reasoning,
+    REASONING_BUDGET,
+    REASONING_SAMPLING,
+    RepetitionControlProcessor,
+    SYSTEM_PROMPT,
+    ThinkCloseStoppingCriteria,
+)
 
 
 class ComediaRAG:
@@ -82,10 +59,12 @@ class ComediaRAG:
         corpus_dir: str = "../../data/04_rag_ready",
         llm_model_name: str = "Qwen/Qwen3.5-9B",
         embedder_model_name: str = "BAAI/bge-m3",
+        use_metadata: bool = True,
         dry_run: bool = False,
     ):
         self.corpus_dir = Path(corpus_dir)
         self.dry_run = dry_run
+        self.use_metadata = use_metadata
 
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         self.compute_type = torch.bfloat16 if self.device == "cuda" else torch.float32
@@ -104,7 +83,8 @@ class ComediaRAG:
             return
 
         json_files = list(self.corpus_dir.glob("*_rag.json"))
-        logger.info(f"Loading {len(json_files)} documents from the Luso-Laugh corpus into LangChain...")
+        mode = "with comedic metadata" if self.use_metadata else "content only"
+        logger.info(f"Loading {len(json_files)} documents from the Luso-Laugh corpus ({mode})...")
 
         lc_documents = []
         for filepath in json_files:
@@ -112,7 +92,9 @@ class ComediaRAG:
                 with open(filepath, "r", encoding="utf-8") as f:
                     doc_data = json.load(f)
 
-                    search_text = f"{doc_data.get('content', '')}\n{doc_data.get('comedic_metadata', '')}"
+                    search_text = doc_data.get("content", "")
+                    if self.use_metadata:
+                        search_text += f"\n{doc_data.get('comedic_metadata', '')}"
                     metadata = {
                         "sketch_id": doc_data.get("sketch_id", "UNKNOWN"),
                         "clean_content": doc_data.get("content", ""),
@@ -146,20 +128,6 @@ class ComediaRAG:
             encode_kwargs={"normalize_embeddings": True},
         )
 
-    @staticmethod
-    def _normalise_reasoning(reasoning_text: str, trim_incomplete: bool = True) -> str:
-        closed = "</think>" in reasoning_text
-
-        body = reasoning_text.split("</think>")[0]
-        body = re.sub(r"</?think>", "", body).strip()
-
-        if not closed and trim_incomplete:
-            cut = max(body.rfind(". "), body.rfind(".\n"), body.rfind("! "), body.rfind("? "))
-            if cut > 200:
-                body = body[: cut + 1]
-
-        return f"<think>\n{body}\n</think>\n\n"
-
     def _init_chain(self, llm_model_name: str):
         """Initializes Qwen-3.5-9B and constructs a decoupled LCEL chain."""
         if self.dry_run:
@@ -180,7 +148,7 @@ class ComediaRAG:
             logger.error(f"Failed to load Generative LLM: {e}")
             self.model = None
 
-    def _generate_bounded(self, messages, reasoning_budget=5000, answer_budget=2250):
+    def _generate_bounded(self, messages: list) -> Tuple[str, str]:
         """Two bounded phases: capped reasoning, then a guaranteed answer budget."""
         prompt = self.tokenizer.apply_chat_template(
             messages, tokenize=False, add_generation_prompt=True, enable_thinking=True
@@ -192,12 +160,9 @@ class ComediaRAG:
                 prompt_len = inputs["input_ids"].shape[1]
                 out1 = self.model.generate(
                     **inputs,
-                    max_new_tokens=reasoning_budget,
-                    do_sample=True,
-                    temperature=1.0,
-                    top_p=0.95,
-                    top_k=50,
-                    logits_processor=LogitsProcessorList([RepetitionControlProcessor(1.05, 0.3, prompt_len)]),
+                    max_new_tokens=REASONING_BUDGET,
+                    **REASONING_SAMPLING,
+                    logits_processor=LogitsProcessorList([RepetitionControlProcessor(prompt_len)]),
                     stopping_criteria=StoppingCriteriaList([ThinkCloseStoppingCriteria(self.tokenizer, prompt_len)]),
                 )
             reasoning_text = self.tokenizer.decode(out1[0, inputs["input_ids"].shape[1] :], skip_special_tokens=False)
@@ -208,8 +173,8 @@ class ComediaRAG:
             torch.cuda.empty_cache()
 
         if "</think>" not in reasoning_text:
-            logger.warning(f"Reasoning did not close within {reasoning_budget} tokens.")
-        reasoning_text = self._normalise_reasoning(reasoning_text)
+            logger.warning(f"Reasoning did not close within {REASONING_BUDGET} tokens.")
+        reasoning_text = normalise_reasoning(reasoning_text)
 
         inputs_answer = self.tokenizer(prompt + reasoning_text, return_tensors="pt").to(self.model.device)
         try:  # Phase 2: answer
@@ -217,12 +182,9 @@ class ComediaRAG:
                 prompt_len = inputs_answer["input_ids"].shape[1]
                 out2 = self.model.generate(
                     **inputs_answer,
-                    max_new_tokens=answer_budget,
-                    do_sample=True,
-                    temperature=0.8,
-                    top_p=0.95,
-                    top_k=50,
-                    logits_processor=LogitsProcessorList([RepetitionControlProcessor(1.05, 0.3, prompt_len)]),
+                    max_new_tokens=ANSWER_BUDGET,
+                    **ANSWER_SAMPLING,
+                    logits_processor=LogitsProcessorList([RepetitionControlProcessor(prompt_len)]),
                 )
             answer_text = self.tokenizer.decode(
                 out2[0, inputs_answer["input_ids"].shape[1] :], skip_special_tokens=True
@@ -233,15 +195,13 @@ class ComediaRAG:
             torch.cuda.synchronize()
             torch.cuda.empty_cache()
 
-        clean_answer = re.sub(r"<think>[\s\S]*?</think>", "", answer_text)
-        clean_answer = re.sub(r"</?think>", "", clean_answer)
-        clean_answer = re.sub(r"^(?:assistant\s*)+", "", clean_answer.strip(), flags=re.IGNORECASE)
-
-        return reasoning_text, clean_answer.strip()
+        return re.sub(r"</?think>", "", reasoning_text).strip(), clean_answer(answer_text)
 
     def generate(self, query: str, format_type: str = "sketch") -> dict:
         if self.dry_run:
             return {"text": f"[DRY RUN] Generated mock {format_type} output.", "sources": []}
+
+        instruction = get_instruction(format_type)
 
         try:
             # explicitly retrieve the documents
@@ -252,7 +212,6 @@ class ComediaRAG:
 
             # extract IDs and actual text
             retrieved_contexts = []
-            retrieved_ids = []
             for doc, score in filtered:
                 logger.info(
                     f'\tscore={score:.4f} // id={doc.metadata["sketch_id"]} // preview="{doc.metadata["clean_content"][:30]}"'
@@ -261,7 +220,6 @@ class ComediaRAG:
                 s_id = doc.metadata.get("sketch_id", "UNKNOWN")
                 s_text = doc.metadata.get("clean_content", "")
 
-                retrieved_ids.append(s_id)
                 retrieved_contexts.append({"sketch_id": s_id, "score": score, "text": s_text})
 
             docs = [doc for doc, _ in filtered]
@@ -282,14 +240,14 @@ class ComediaRAG:
                         "content": (
                             "Aqui estão sketches de referência para inspiração de ritmo, "
                             f"cadência e registo:\n\n{formatted_context}\n\n"
-                            f"{MACRO_INSTRUCTION}\n\n{query}"
+                            f"{instruction}\n\n{query}"
                         ),
                     },
                 ]
             else:
                 messages = [
                     {"role": "system", "content": SYSTEM_PROMPT},
-                    {"role": "user", "content": f"{MACRO_INSTRUCTION}\n\n{query}"},
+                    {"role": "user", "content": f"{instruction}\n\n{query}"},
                 ]
                 logger.warning(f"No sufficiently relevant sketches found for query: {query[:60]}...")
 
@@ -313,15 +271,19 @@ class ComediaRAG:
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="ComedIA RAG Batch Generator")
     parser.add_argument("--dry-run", action="store_true", help="Run without loading Qwen model")
+    parser.add_argument(
+        "--no-metadata", action="store_true", help="Index sketch content only, without punchline annotations"
+    )
     args = parser.parse_args()
 
     script_dir = Path(__file__).resolve().parent
     corpus_dir = os.path.normpath(script_dir / "../../data/04_rag_ready")
     input_path = os.path.normpath(script_dir / "input_prompts.json")
-    output_path = os.path.normpath(script_dir / "../../data/06_comedia_outputs/ComedIA_RAG_outputs.json")
+    suffix = "_NM" if args.no_metadata else ""
+    output_path = os.path.normpath(script_dir / f"../../data/06_comedia_outputs/ComedIA_RAG{suffix}_outputs.json")
 
     # load input dataset
-    if not input_path:
+    if not Path(input_path).exists():
         logger.error(f"Input file '{input_path}' not found.")
         exit(1)
 
@@ -331,7 +293,12 @@ if __name__ == "__main__":
     logger.info(f"Loaded {len(prompts_list)} prompt pairs from {input_path}")
 
     # initialize RAG system
-    rag_system = ComediaRAG(corpus_dir=str(corpus_dir), llm_model_name="Qwen/Qwen3.5-9B", dry_run=args.dry_run)
+    rag_system = ComediaRAG(
+        corpus_dir=str(corpus_dir),
+        llm_model_name="Qwen/Qwen3.5-9B",
+        use_metadata=not args.no_metadata,
+        dry_run=args.dry_run,
+    )
 
     # batch processing loop
     output_data = []

@@ -9,13 +9,28 @@ import sys
 import torch
 import transformers
 from transformers import (
-    LogitsProcessor,
     LogitsProcessorList,
     set_seed,
-    StoppingCriteria,
     StoppingCriteriaList,
 )
 from typing import Dict, Tuple
+
+src_dir = str(Path(__file__).resolve().parents[1])
+if src_dir not in sys.path:
+    sys.path.insert(0, src_dir)
+
+from common import (
+    ANSWER_BUDGET,
+    ANSWER_SAMPLING,
+    clean_answer,
+    get_instruction,
+    normalise_reasoning,
+    REASONING_BUDGET,
+    REASONING_SAMPLING,
+    RepetitionControlProcessor,
+    SYSTEM_PROMPT,
+    ThinkCloseStoppingCriteria,
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -28,46 +43,6 @@ logger = logging.getLogger(__name__)
 transformers.logging.set_verbosity_error()
 os.environ["HF_HUB_DISABLE_TELEMETRY"] = "1"
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
-
-
-data_process_dir = (Path(__file__).resolve().parent.parent / "02_data_process").resolve()
-if str(data_process_dir) not in sys.path:
-    sys.path.insert(0, str(data_process_dir))
-
-from D_data_transform import MACRO_INSTRUCTION, SYSTEM_PROMPT
-
-
-class ThinkCloseStoppingCriteria(StoppingCriteria):
-    """
-    Thinking Block stopping criteria
-    """
-
-    def __init__(self, tokenizer, prompt_len):
-        self.tokenizer = tokenizer
-        self.prompt_len = prompt_len
-
-    def __call__(self, input_ids, scores, **kwargs):
-        tail_ids = input_ids[0, self.prompt_len :]
-        tail_text = self.tokenizer.decode(tail_ids[-8:], skip_special_tokens=False)
-        return "</think>" in tail_text
-
-
-class RepetitionControlProcessor(LogitsProcessor):
-    """Penalise repetition within a recent window only."""
-
-    def __init__(self, presence, frequency, prompt_len, max_freq=4.0, window=64):
-        self.presence, self.frequency = presence, frequency
-        self.prompt_len, self.max_freq, self.window = prompt_len, max_freq, window
-
-    def __call__(self, input_ids, scores):
-        gen = input_ids[:, self.prompt_len :]
-        for i in range(scores.shape[0]):
-            recent = gen[i][-self.window :]
-            if not recent.numel():
-                continue
-            toks, counts = torch.unique(recent, return_counts=True)
-            scores[i, toks] -= self.presence + torch.clamp(self.frequency * counts.to(scores.dtype), max=self.max_freq)
-        return scores
 
 
 class ComediaBaseline:
@@ -106,23 +81,7 @@ class ComediaBaseline:
             logger.error(f"Failed to load Generative LLM: {e}")
             self.model = None
 
-    @staticmethod
-    def _normalise_reasoning(reasoning_text: str, trim_incomplete: bool = True) -> str:
-        closed = "</think>" in reasoning_text
-
-        body = reasoning_text.split("</think>")[0]
-        body = re.sub(r"</?think>", "", body).strip()
-
-        if not closed and trim_incomplete:
-            cut = max(body.rfind(". "), body.rfind(".\n"), body.rfind("! "), body.rfind("? "))
-            if cut > 200:
-                body = body[: cut + 1]
-
-        return f"<think>\n{body}\n</think>\n\n"
-
-    def _generate_bounded(
-        self, messages: list, reasoning_budget: int = 5000, answer_budget: int = 2250
-    ) -> Tuple[str, str]:
+    def _generate_bounded(self, messages: list) -> Tuple[str, str]:
         """
         Executes a two-phase generation process: capped reasoning followed by a guaranteed answer.
         """
@@ -137,12 +96,9 @@ class ComediaBaseline:
                 prompt_len = inputs["input_ids"].shape[1]
                 out1 = self.model.generate(
                     **inputs,
-                    max_new_tokens=reasoning_budget,
-                    do_sample=True,
-                    temperature=1.0,
-                    top_p=0.95,
-                    top_k=50,
-                    logits_processor=LogitsProcessorList([RepetitionControlProcessor(1.05, 0.3, prompt_len)]),
+                    max_new_tokens=REASONING_BUDGET,
+                    **REASONING_SAMPLING,
+                    logits_processor=LogitsProcessorList([RepetitionControlProcessor(prompt_len)]),
                     stopping_criteria=StoppingCriteriaList([ThinkCloseStoppingCriteria(self.tokenizer, prompt_len)]),
                 )
             reasoning_text = self.tokenizer.decode(out1[0, inputs["input_ids"].shape[1] :], skip_special_tokens=False)
@@ -153,8 +109,8 @@ class ComediaBaseline:
             torch.cuda.empty_cache()
 
         if "</think>" not in reasoning_text:
-            logger.warning(f"Reasoning did not close within {reasoning_budget} tokens.")
-        reasoning_text = self._normalise_reasoning(reasoning_text)
+            logger.warning(f"Reasoning did not close within {REASONING_BUDGET} tokens.")
+        reasoning_text = normalise_reasoning(reasoning_text)
 
         # Phase 2: Final answer generation
         inputs_answer = self.tokenizer(prompt + reasoning_text, return_tensors="pt").to(self.model.device)
@@ -163,12 +119,9 @@ class ComediaBaseline:
                 prompt_len = inputs_answer["input_ids"].shape[1]
                 out2 = self.model.generate(
                     **inputs_answer,
-                    max_new_tokens=answer_budget,
-                    do_sample=True,
-                    temperature=0.8,
-                    top_p=0.95,
-                    top_k=50,
-                    logits_processor=LogitsProcessorList([RepetitionControlProcessor(1.05, 0.3, prompt_len)]),
+                    max_new_tokens=ANSWER_BUDGET,
+                    **ANSWER_SAMPLING,
+                    logits_processor=LogitsProcessorList([RepetitionControlProcessor(prompt_len)]),
                 )
             answer_text = self.tokenizer.decode(
                 out2[0, inputs_answer["input_ids"].shape[1] :], skip_special_tokens=True
@@ -179,22 +132,18 @@ class ComediaBaseline:
             torch.cuda.synchronize()
             torch.cuda.empty_cache()
 
-        clean_answer = re.sub(r"<think>[\s\S]*?</think>", "", answer_text)
-        clean_answer = re.sub(r"</?think>", "", clean_answer)
-        clean_answer = re.sub(r"^(?:assistant\s*)+", "", clean_answer.strip(), flags=re.IGNORECASE)
-
-        clean_reasoning = re.sub(r"</?think>", "", reasoning_text).strip()
-
-        return clean_reasoning, clean_answer.strip()
+        return re.sub(r"</?think>", "", reasoning_text).strip(), clean_answer(answer_text)
 
     def generate(self, query: str, format_type: str = "sketch") -> Dict:
         if self.dry_run:
             return {"text": f"[DRY RUN] Generated mock {format_type} output.", "sources": []}
 
+        instruction = get_instruction(format_type)
+
         try:
             messages = [
                 {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": f"{MACRO_INSTRUCTION}\n\n{query}"},
+                {"role": "user", "content": f"{instruction}\n\n{query}"},
             ]
             reasoning, response = self._generate_bounded(messages)
             return {
@@ -228,13 +177,13 @@ if __name__ == "__main__":
         prompts_list = json.load(f)
 
     logger.info(f"Loaded {len(prompts_list)} prompt pairs from {input_path}")
+    set_seed(42)
 
     baseline_system = ComediaBaseline(llm_model_name="Qwen/Qwen3.5-9B", dry_run=args.dry_run)
 
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
     output_data = []
     total_items = len(prompts_list)
-    set_seed(42)
 
     for idx, item in enumerate(prompts_list, start=1):
         theme = item.get("theme", "general")

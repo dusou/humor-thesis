@@ -1,4 +1,5 @@
 import argparse
+from common.prompts import MACRO_INSTRUCTION, SYSTEM_PROMPT
 import json
 import logging
 import os
@@ -28,41 +29,6 @@ if qwen_folder.exists():
     logger.info("Local models found. Engaging offline mode.")
 else:
     logger.info("Models missing. Allowing internet access for initial download...")
-
-
-SYSTEM_PROMPT = (
-    "És um argumentista profissional de comédia e sátira portuguesa.\n"
-    "Escreves exclusivamente em Português Europeu (PT-PT), usando o vocabulário, "
-    "a sintaxe e as expressões idiomáticas correntes em Portugal.\n"
-    "O teu humor é observacional, irónico e subversivo: ancoras as piadas na "
-    "realidade social, política e quotidiana portuguesa e escalas o absurdo a "
-    "partir de premissas reconhecíveis.\n"
-    "Nunca explicas a piada depois de a fazeres e "
-    "preferes o risco cómico à segurança de um texto genérico.\n"
-    "Se te forem dados sketches de referência, usa-os apenas como modelo de "
-    "ritmo, cadência e registo, nunca reaproveites as suas falas ou premissas."
-)
-
-MACRO_INSTRUCTION = (
-    "Escreve um sketch de comédia original em Português de Portugal a partir do "
-    "tema e premissa indicados no fim.\n\n"
-    "Antes de escreveres, planeia o arco cómico completo no teu raciocínio interno "
-    "seguindo a estrutura: ELENCO, ABORDAGEM REJEITADA, ARCO CÓMICO (com expectativa, "
-    "violação e lógica interna para cada piada) e ESCALADA.\n\n"
-    "IMPORTANTE: o plano é apenas para teu uso interno. A tua resposta final deve "
-    "conter APENAS o guião em falas, sem plano, sem títulos de secção, sem ELENCO, "
-    "sem comentários.\n\nRegras de escrita:\n"
-    "1. Escreve o guião em falas. Cada fala ocupa uma linha própria, precedida "
-    "pelo nome da personagem em maiúsculas entre parênteses retos: [NOME]: fala.\n"
-    "2. Podes acrescentar didascálias breves em linha própria, entre parênteses "
-    "retos e sem dois pontos, no máximo uma por cada seis falas.\n"
-    "3. Fixa as personagens no início e mantém-nas até ao fim.\n"
-    "4. Constrói uma escalada: cada piada deve subir a aposta da anterior e "
-    "terminar na punchline mais forte.\n"
-    "5. Usa referências culturais portuguesas concretas em vez de genéricas.\n"
-    "6. Extensão alvo: 500 a 900 palavras.\n\n"
-    "Tema e premissa:"
-)
 
 
 class TrainingDataFormatter:

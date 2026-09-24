@@ -32,12 +32,12 @@
     {
         "theme": "obras públicas",
         "format": "sketch",
-        "prompt": "Uma crónica satírica sobre a novela interminável da escolha da localização do novo aeroporto de Lisboa, sugerindo soluções cada vez mais absurdas."
+        "prompt": "Uma sketch satírica sobre a novela interminável da escolha da localização do novo aeroporto de Lisboa, sugerindo soluções cada vez mais absurdas."
     },
     {
         "theme": "verão no Algarve",
         "format": "sketch",
-        "prompt": "Um artigo de opinião humorístico sobre as regras não escritas das férias no Algarve em agosto."
+        "prompt": "Um sketch humorístico sobre as regras não escritas das férias no Algarve em agosto."
     },
     {
         "theme": "entrevista desviada",
