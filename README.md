@@ -39,7 +39,6 @@ Only `data/01_catalogs` ships with the code. Every other `data/` folder is creat
 ## Setup
 
 **Python and packages.** I used Python 3.10. `requirements.txt` lists all the required packages.
-```
 
 You also need `ffmpeg` on the system for `yt-dlp`.
 
