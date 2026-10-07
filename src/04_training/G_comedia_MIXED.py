@@ -197,7 +197,7 @@ class ComediaHybridGenerator:
                     out_answer[0, inputs_answer["input_ids"].shape[1] :], skip_special_tokens=True
                 )
         finally:
-            del inputs_answer, out_answer
+            del inputs_answer
             gc.collect()
             torch.cuda.synchronize()
             torch.cuda.empty_cache()
@@ -218,7 +218,7 @@ class ComediaHybridGenerator:
             retrieved_contexts = []
             for doc, score in filtered:
                 logger.info(
-                    f'\tscore={score:.4f} | id={doc.metadata["sketch_id"]} | preview="{doc.metadata["clean_content"][:30]}"'
+                    f' score={score:.4f} | id={doc.metadata["sketch_id"]} | preview="{doc.metadata["clean_content"][:30]}"'
                 )
                 s_id = doc.metadata.get("sketch_id", "UNKNOWN")
                 s_text = doc.metadata.get("clean_content", "")
